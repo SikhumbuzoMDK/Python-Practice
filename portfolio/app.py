@@ -1,446 +1,844 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-from datetime import datetime, timedelta
-
-# Import from data_fetcher module
-from data_fetcher import (
-    fetch_ohlcv,
-    generate_synthetic_data,
-    SUPPORTED_INSTRUMENTS,
-    INTERVAL_PERIODS,
-)
-
-st.set_page_config(page_title="SMA-Slope Pullback Strategy Dashboard", layout="wide")
-
-
-# ==================== PARAMS ====================
-PARAMS = {
-    "Base Case": dict(
-        SLOPE_THRESHOLD=0.00025, TOLERANCE_MULT=0.10, INVALIDATE_MULT=0.60,
-        SL_BUFFER_MULT=0.10, MIN_PULLBACK_BARS=2, RR_TARGET=2.0,
-        MIN_RISK_PRICE=0.0003, SMA_PERIOD=50, SLOPE_LOOKBACK=5, ATR_PERIOD=14,
-        ENTRY_MODE="sma_reclaim", BREAKEVEN_AT_R=1.0,
-    ),
-    "Loose Filter": dict(
-        SLOPE_THRESHOLD=0.00010, TOLERANCE_MULT=0.10, INVALIDATE_MULT=0.60,
-        SL_BUFFER_MULT=0.10, MIN_PULLBACK_BARS=1, RR_TARGET=2.0,
-        MIN_RISK_PRICE=0.0003, SMA_PERIOD=50, SLOPE_LOOKBACK=5, ATR_PERIOD=14,
-        ENTRY_MODE="sma_reclaim", BREAKEVEN_AT_R=1.0,
-    ),
-}
-
-
-# ==================== NEW STRATEGY ENGINE ====================
-def run_backtest(data, p):
-    df = data.copy()
-
-    # Indicators
-    df["SMA"] = df["Close"].rolling(p["SMA_PERIOD"]).mean()
-    df["SMA_Slope"] = df["SMA"].diff(p["SLOPE_LOOKBACK"])
-
-    # True Range & ATR
-    df["PrevClose"] = df["Close"].shift(1)
-    df["TR"] = np.maximum(
-        df["High"] - df["Low"],
-        np.maximum(abs(df["High"] - df["PrevClose"]), abs(df["Low"] - df["PrevClose"])),
-    )
-    df["ATR"] = df["TR"].rolling(p["ATR_PERIOD"]).mean()
-    df.dropna(inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    state = "LOOKING"
-    trades = []
-    swing_high = -np.inf
-    swing_low = np.inf
-    pull_extreme = np.nan
-    pullback_bars = 0
-    entry = sl = tp = risk = 0
-    entry_time = None
-    direction = None
-
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        c, h, l, sma, slope, atr = row["Close"], row["High"], row["Low"], row["SMA"], row["SMA_Slope"], row["ATR"]
-        pc, psma = prev["Close"], prev["SMA"]
-
-        # --- TRADE MANAGEMENT ---
-        if state == "IN_TRADE":
-            if direction == "LONG":
-                if l <= sl:
-                    r = (sl - entry) / risk
-                    trades.append([entry_time, row["Time"], "LONG", entry, sl, tp, sl, round(r, 2)])
-                    state = "LOOKING"
-                    continue
-                elif h >= tp:
-                    trades.append([entry_time, row["Time"], "LONG", entry, sl, tp, tp, p["RR_TARGET"]])
-                    state = "LOOKING"
-                    continue
-                if h >= entry + (risk * p["BREAKEVEN_AT_R"]):
-                    sl = max(sl, entry)
-            elif direction == "SHORT":
-                if h >= sl:
-                    r = (entry - sl) / risk
-                    trades.append([entry_time, row["Time"], "SHORT", entry, sl, tp, sl, round(r, 2)])
-                    state = "LOOKING"
-                    continue
-                elif l <= tp:
-                    trades.append([entry_time, row["Time"], "SHORT", entry, sl, tp, tp, p["RR_TARGET"]])
-                    state = "LOOKING"
-                    continue
-                if l <= entry - (risk * p["BREAKEVEN_AT_R"]):
-                    sl = min(sl, entry)
-            continue
-
-        # --- SETUP LOGIC ---
-        if state == "LOOKING":
-            if pc < psma and c > sma:
-                state = "BULL_IMPULSE"
-                swing_high = h
-                swing_low = l
-            elif pc > psma and c < sma:
-                state = "BEAR_IMPULSE"
-                swing_high = h
-                swing_low = l
-        # BULL
-        elif state == "BULL_IMPULSE":
-            swing_high = max(swing_high, h)
-            if l <= sma:
-                if slope >= p["SLOPE_THRESHOLD"]:
-                    state = "BULL_PULLBACK"
-                    pull_extreme = l
-                    pullback_bars = 1
-                else:
-                    state = "LOOKING"
-        elif state == "BULL_PULLBACK":
-            pullback_bars += 1
-            pull_extreme = min(pull_extreme, l)
-            if l < swing_low or slope < (p["SLOPE_THRESHOLD"] * p["INVALIDATE_MULT"]):
-                state = "LOOKING"
-                continue
-            if c > sma:
-                if pullback_bars >= p["MIN_PULLBACK_BARS"]:
-                    entry = c
-                    raw_sl = pull_extreme - (atr * p["SL_BUFFER_MULT"])
-                    risk = max(entry - raw_sl, p["MIN_RISK_PRICE"])
-                    sl = entry - risk
-                    tp = entry + (risk * p["RR_TARGET"])
-                    direction = "LONG"
-                    entry_time = row["Time"]
-                    state = "IN_TRADE"
-                else:
-                    state = "LOOKING"
-        # BEAR
-        elif state == "BEAR_IMPULSE":
-            swing_low = min(swing_low, l)
-            if h >= sma:
-                if slope <= -p["SLOPE_THRESHOLD"]:
-                    state = "BEAR_PULLBACK"
-                    pull_extreme = h
-                    pullback_bars = 1
-                else:
-                    state = "LOOKING"
-        elif state == "BEAR_PULLBACK":
-            pullback_bars += 1
-            pull_extreme = max(pull_extreme, h)
-            if h > swing_high or slope > -(p["SLOPE_THRESHOLD"] * p["INVALIDATE_MULT"]):
-                state = "LOOKING"
-                continue
-            if c < sma:
-                if pullback_bars >= p["MIN_PULLBACK_BARS"]:
-                    entry = c
-                    raw_sl = pull_extreme + (atr * p["SL_BUFFER_MULT"])
-                    risk = max(raw_sl - entry, p["MIN_RISK_PRICE"])
-                    sl = entry + risk
-                    tp = entry - (risk * p["RR_TARGET"])
-                    direction = "SHORT"
-                    entry_time = row["Time"]
-                    state = "IN_TRADE"
-                else:
-                    state = "LOOKING"
-
-    trade_cols = ["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R"]
-    trades_df = pd.DataFrame(trades, columns=trade_cols)
-    if not trades_df.empty:
-        trades_df["Equity"] = trades_df["R"].cumsum()
-    return trades_df
-
-
-def compute_signal(data, p):
-    """Compute current signal using the new strategy logic up to the latest bar."""
-    df = data.copy()
-    df["SMA"] = df["Close"].rolling(p["SMA_PERIOD"]).mean()
-    df["SMA_Slope"] = df["SMA"].diff(p["SLOPE_LOOKBACK"])
-    df["PrevClose"] = df["Close"].shift(1)
-    df["TR"] = np.maximum(
-        df["High"] - df["Low"],
-        np.maximum(abs(df["High"] - df["PrevClose"]), abs(df["Low"] - df["PrevClose"])),
-    )
-    df["ATR"] = df["TR"].rolling(p["ATR_PERIOD"]).mean()
-    df.dropna(inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    state = "LOOKING"
-    swing_high = -np.inf
-    swing_low = np.inf
-    pull_extreme = np.nan
-    pullback_bars = 0
-    entry = sl = tp = risk = 0
-    direction = None
-
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        c, h, l, sma, slope, atr = row["Close"], row["High"], row["Low"], row["SMA"], row["SMA_Slope"], row["ATR"]
-        pc, psma = prev["Close"], prev["SMA"]
-
-        if state == "IN_TRADE":
-            if direction == "LONG":
-                if l <= sl or h >= tp:
-                    state = "LOOKING"
-                    continue
-                if h >= entry + (risk * p["BREAKEVEN_AT_R"]):
-                    sl = max(sl, entry)
-            elif direction == "SHORT":
-                if h >= sl or l <= tp:
-                    state = "LOOKING"
-                    continue
-                if l <= entry - (risk * p["BREAKEVEN_AT_R"]):
-                    sl = min(sl, entry)
-            continue
-
-        if state == "LOOKING":
-            if pc < psma and c > sma:
-                state = "BULL_IMPULSE"
-                swing_high = h
-                swing_low = l
-            elif pc > psma and c < sma:
-                state = "BEAR_IMPULSE"
-                swing_high = h
-                swing_low = l
-        elif state == "BULL_IMPULSE":
-            swing_high = max(swing_high, h)
-            if l <= sma:
-                if slope >= p["SLOPE_THRESHOLD"]:
-                    state = "BULL_PULLBACK"
-                    pull_extreme = l
-                    pullback_bars = 1
-                else:
-                    state = "LOOKING"
-        elif state == "BULL_PULLBACK":
-            pullback_bars += 1
-            pull_extreme = min(pull_extreme, l)
-            if l < swing_low or slope < (p["SLOPE_THRESHOLD"] * p["INVALIDATE_MULT"]):
-                state = "LOOKING"
-                continue
-            if c > sma:
-                if pullback_bars >= p["MIN_PULLBACK_BARS"]:
-                    entry = c
-                    raw_sl = pull_extreme - (atr * p["SL_BUFFER_MULT"])
-                    risk = max(entry - raw_sl, p["MIN_RISK_PRICE"])
-                    sl = entry - risk
-                    tp = entry + (risk * p["RR_TARGET"])
-                    direction = "LONG"
-                    state = "IN_TRADE"
-                else:
-                    state = "LOOKING"
-        elif state == "BEAR_IMPULSE":
-            swing_low = min(swing_low, l)
-            if h >= sma:
-                if slope <= -p["SLOPE_THRESHOLD"]:
-                    state = "BEAR_PULLBACK"
-                    pull_extreme = h
-                    pullback_bars = 1
-                else:
-                    state = "LOOKING"
-        elif state == "BEAR_PULLBACK":
-            pullback_bars += 1
-            pull_extreme = max(pull_extreme, h)
-            if h > swing_high or slope > -(p["SLOPE_THRESHOLD"] * p["INVALIDATE_MULT"]):
-                state = "LOOKING"
-                continue
-            if c < sma:
-                if pullback_bars >= p["MIN_PULLBACK_BARS"]:
-                    entry = c
-                    raw_sl = pull_extreme + (atr * p["SL_BUFFER_MULT"])
-                    risk = max(raw_sl - entry, p["MIN_RISK_PRICE"])
-                    sl = entry + risk
-                    tp = entry - (risk * p["RR_TARGET"])
-                    direction = "SHORT"
-                    state = "IN_TRADE"
-
-    sig = "WAIT"
-    if state == "IN_TRADE":
-        sig = "LONG" if direction == "LONG" else "SHORT"
-    current_price = df.iloc[-1]["Close"]
-    sma_val = df.iloc[-1]["SMA"]
-    return {
-        "state": state,
-        "signal": sig,
-        "current_price": current_price,
-        "sma": sma_val,
-        "entry": entry,
-        "stop": sl,
-        "target": tp,
-    }
-
-
-# ==================== METRICS & SIZING ====================
-def compute_metrics(trades):
-    if trades is None or len(trades) == 0:
-        return {
-            "Trades": 0, "Wins": 0, "Losses": 0, "Win Rate": 0.0,
-            "Average R": 0.0, "Total R": 0.0, "Profit Factor": 0.0, "Max Drawdown (R)": 0.0,
-        }
-    wins = int((trades["R"] > 0).sum())
-    losses = int((trades["R"] < 0).sum())
-    total_r = float(trades["R"].sum())
-    avg_r = float(trades["R"].mean())
-    win_rate = float((trades["R"] > 0).mean())
-    gross_profit = float(trades[trades["R"] > 0]["R"].sum())
-    gross_loss = float(abs(trades[trades["R"] < 0]["R"].sum()))
-    pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
-    eq = trades["Equity"]
-    drawdowns = eq - eq.cummax()
-    max_dd = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
-    return {
-        "Trades": len(trades), "Wins": wins, "Losses": losses, "Win Rate": win_rate,
-        "Average R": avg_r, "Total R": total_r, "Profit Factor": pf, "Max Drawdown (R)": max_dd,
-    }
-
-
-def format_metrics_for_display(metrics):
-    return pd.DataFrame({
-        "Metric": list(metrics.keys()),
-        "Value": [
-            metrics["Trades"], metrics["Wins"], metrics["Losses"],
-            f"{metrics['Win Rate']:.2%}", metrics["Average R"], metrics["Total R"],
-            metrics["Profit Factor"], metrics["Max Drawdown (R)"],
-        ],
-    })
-
-
-def position_sizing(account, risk_pct, entry, stop):
-    risk_amount = account * (risk_pct / 100.0)
-    stop_distance = abs(entry - stop)
-    if stop_distance == 0 or np.isnan(stop_distance):
-        return {"risk_amount": risk_amount, "units": 0, "notional": 0}
-    units = risk_amount / stop_distance
-    notional = units * entry
-    return {"risk_amount": risk_amount, "units": units, "notional": notional}
-
-
-# ==================== CACHED FETCH ====================
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_fetch(symbol, interval, source):
-    if source == "Live (yfinance)":
-        return fetch_ohlcv(symbol, interval=interval)
-    else:
-        freq = "h"
-        if interval == "15m":
-            freq = "15min"
-        elif interval == "30m":
-            freq = "30min"
-        elif interval == "1d":
-            freq = "D"
-        return generate_synthetic_data(symbol, freq=freq)
-
-
-# ==================== UI ====================
-st.title("SMA-Slope Pullback Strategy Dashboard")
-st.markdown("**Strategy:** Impulse + pullback to 50-SMA with slope filter, ATR-scaled stops, and 2R target. Initial account **R100,000**.")
-
-with st.sidebar:
-    st.header("Settings")
-    instrument = st.selectbox("Instrument", list(SUPPORTED_INSTRUMENTS.keys()))
-    scenario = st.selectbox("Scenario", list(PARAMS.keys()))
-    interval = st.selectbox("Interval", ["15m", "30m", "1h", "1d"], index=2)
-    sma_period = st.number_input("SMA Period", min_value=10, max_value=200, value=50, step=1)
-    rr_target = st.number_input("RR Target", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
-    initial_capital = st.number_input("Initial Capital (R)", min_value=1000, value=100000, step=1000)
-    risk_pct = st.number_input("Risk per Trade (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
-    data_source = st.radio("Data Source", ["Live (yfinance)", "Synthetic"])
-    run_btn = st.button("Run Backtest")
-
-if run_btn:
-    p = dict(PARAMS[scenario])
-    p["SMA_PERIOD"] = int(sma_period)
-    p["RR_TARGET"] = float(rr_target)
-
-    df = cached_fetch(instrument, interval, data_source)
-
-    if df is None or len(df) == 0:
-        st.error("Failed to fetch data. Try another interval or use Synthetic data.")
-    else:
-        trades = run_backtest(df, p)
-        signal = compute_signal(df, p)
-        metrics = compute_metrics(trades)
-
-        data_start = df["Time"].min()
-        data_end = df["Time"].max()
-        st.caption(
-            f"Backtest data: **{data_start} → {data_end}** ({len(df)} bars, interval {interval}). "
-            f"Current signal derived from latest bar ({data_end})."
-        )
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Current Signal", signal["signal"])
-        col2.metric("Current Price", round(signal["current_price"], 4) if signal["current_price"] is not None else "N/A")
-        col3.metric("Total Trades", str(metrics["Trades"]))
-        col4.metric("Total R", str(round(metrics["Total R"], 2)))
-
-        st.subheader("Current Setup (Today)")
-        if signal["signal"] != "WAIT":
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Entry", round(signal["entry"], 4) if not np.isnan(signal["entry"]) else "N/A")
-            s2.metric("Stop", round(signal["stop"], 4) if not np.isnan(signal["stop"]) else "N/A")
-            s3.metric("Target", round(signal["target"], 4) if not np.isnan(signal["target"]) else "N/A")
-        else:
-            st.info("No active trade setup for today. Strategy is waiting for a valid impulse-pullback signal.")
-
-        st.subheader("Position Sizing (R100,000 account)")
-        if signal["signal"] != "WAIT" and not np.isnan(signal["entry"]) and not np.isnan(signal["stop"]):
-            sizing = position_sizing(initial_capital, risk_pct, signal["entry"], signal["stop"])
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Risk Amount (R)", round(sizing["risk_amount"], 2))
-            p2.metric("Units", round(sizing["units"], 2))
-            p3.metric("Notional (R)", round(sizing["notional"], 2))
-        else:
-            st.info("Position sizing will appear once a signal is active.")
-
-        tab1, tab2, tab3 = st.tabs(["Performance Dashboard", "Trade Log", "Summary"])
-
-        with tab1:
-            st.subheader("Equity Curve")
-            if len(trades) > 0:
-                eq_df = trades[["Entry Time", "Equity"]].copy()
-                initial_eq = pd.DataFrame({"Entry Time": [eq_df.iloc[0]["Entry Time"]], "Equity": [0]})
-                eq_df = pd.concat([initial_eq, eq_df], ignore_index=True)
-                fig = px.line(eq_df, x="Entry Time", y="Equity", markers=True, title="Equity Curve (R multiples)")
-                st.plotly_chart(fig, width="stretch")
-
-                st.subheader("R Distribution")
-                fig2 = px.histogram(trades, x="R", nbins=40, title="Trade R-Distribution")
-                st.plotly_chart(fig2, width="stretch")
-            else:
-                st.warning("No trades generated for the current parameters.")
-
-        with tab2:
-            st.subheader("Trade Log")
-            if len(trades) > 0:
-                st.dataframe(trades)
-                csv = trades.to_csv(index=False)
-                st.download_button("Download Trade Log CSV", data=csv, file_name="trade_log.csv", mime="text/csv")
-            else:
-                st.warning("No trades to display.")
-
-        with tab3:
-            st.subheader("Summary Metrics")
-            display_df = format_metrics_for_display(metrics)
-            st.dataframe(display_df)
-            summary_csv = display_df.to_csv(index=False)
-            st.download_button("Download Summary CSV", data=summary_csv, file_name="summary.csv", mime="text/csv")
-else:
-    st.info("Adjust settings in the sidebar and click **Run Backtest** to fetch max-history data, generate trades, and see today's signal.")
+import streamlit as st\
+import pandas as pd\
+import numpy as np\
+import plotly.express as px\
+from datetime import datetime\
+\
+from data_fetcher import (\
+fetch_ohlcv,\
+generate_synthetic_data,\
+SUPPORTED_INSTRUMENTS,\
+INTERVAL_PERIODS,\
+)\
+\
+# -----------------------------------------------------------------------------\
+# Common Utilities\
+# -----------------------------------------------------------------------------\
+\
+def compute_metrics(trades):\
+"""Compute all metrics numerically. Returns dict with all numeric values."""\
+if trades is None or len(trades) == 0:\
+return {\
+'total_trades': 0,\
+'win_rate': 0.0,\
+'total_r': 0.0,\
+'avg_r': 0.0,\
+'profit_factor': 0.0,\
+'max_drawdown': 0.0,\
+}\
+\
+total_trades = len(trades)\
+wins = trades[trades['R'] > 0]\
+win_rate = len(wins) / total_trades if total_trades else 0.0\
+total_r = trades['R'].sum()\
+avg_r = trades['R'].mean()\
+\
+losses = trades[trades['R'] < 0]['R'].sum()\
+profits = trades[trades['R'] > 0]['R'].sum()\
+profit_factor = abs(profits / losses) if losses != 0 else float('inf')\
+\
+equity = trades['Equity'].values\
+if len(equity) > 0:\
+peak = np.maximum.accumulate(equity)\
+drawdown = (equity - peak) / peak\
+max_drawdown = drawdown.min()\
+else:\
+max_drawdown = 0.0\
+\
+return {\
+'total_trades': total_trades,\
+'win_rate': win_rate,\
+'total_r': total_r,\
+'avg_r': avg_r,\
+'profit_factor': profit_factor,\
+'max_drawdown': max_drawdown,\
+}\
+\
+\
+def format_metrics_for_display(metrics):\
+"""Format metrics for display with strings/percentages."""\
+formatted = {}\
+for k, v in metrics.items():\
+if k == 'win_rate':\
+formatted[k] = f"{v*100:.1f}%"\
+elif k == 'max_drawdown':\
+formatted[k] = f"{v*100:.2f}%"\
+elif k in ['total_r', 'avg_r', 'profit_factor']:\
+formatted[k] = f"{v:.2f}"\
+else:\
+formatted[k] = f"{v}"\
+return formatted\
+\
+\
+def position_sizing(account, risk_pct, entry, stop):\
+"""Compute position size in units based on risk percentage."""\
+if entry is None or stop is None:\
+return 0.0\
+risk_per_trade = account * (risk_pct / 100.0)\
+risk_per_share = abs(entry - stop)\
+if risk_per_share == 0:\
+return 0.0\
+return risk_per_trade / risk_per_share\
+\
+\
+# -----------------------------------------------------------------------------\
+# Strategy A: SMA-Slope Pullback\
+# -----------------------------------------------------------------------------\
+\
+def run_backtest_sma_slope(data, p):\
+"""Run SMA-Slope Pullback backtest."""\
+df = data.copy()\
+df['SMA'] = df['Close'].rolling(p['SMA_PERIOD']).mean()\
+df['SMA_Slope'] = df['SMA'].diff(p['SLOPE_LOOKBACK'])\
+\
+df['TR'] = np.maximum(df['High'] - df['Low'],\
+np.maximum(abs(df['High'] - df['Close'].shift()),\
+abs(df['Low'] - df['Close'].shift())))\
+df['ATR'] = df['TR'].rolling(p['ATR_PERIOD']).mean()\
+\
+\
+trades = []\
+state = 'LOOKING'\
+swing_high = None\
+swing_low = None\
+pull_extreme = None\
+pullback_bars = 0\
+entry = sl = tp = 0.0\
+raw_sl = 0.0\
+direction = 0\
+\
+equity = 0.0\
+risk_per_trade = 0.0\
+\
+for i in range(p['SMA_PERIOD'] + p['SLOPE_LOOKBACK'] + p['ATR_PERIOD'], len(df)):\
+c = df['Close'].iloc[i]\
+h = df['High'].iloc[i]\
+l = df['Low'].iloc[i]\
+sma = df['SMA'].iloc[i]\
+slope = df['SMA_Slope'].iloc[i]\
+atr = df['ATR'].iloc[i]\
+\
+pc = df['Close'].iloc[i-1]\
+psma = df['SMA'].iloc[i-1]\
+\
+if state == 'LOOKING':\
+if pc < psma and c > sma:\
+state = 'BULL_IMPULSE'\
+swing_high = h\
+elif pc > psma and c < sma:\
+state = 'BEAR_IMPULSE'\
+swing_low = l\
+\
+elif state == 'BULL_IMPULSE':\
+if h > swing_high:\
+swing_high = h\
+if l <= sma and slope >= p['SLOPE_THRESHOLD']:\
+state = 'BULL_PULLBACK'\
+pull_extreme = l\
+pullback_bars = 0\
+elif slope < p['SLOPE_THRESHOLD'] * p['INVALIDATE_MULT']:\
+state = 'LOOKING'\
+\
+elif state == 'BULL_PULLBACK':\
+if l < pull_extreme:\
+pull_extreme = l\
+if l < swing_low or slope < p['SLOPE_THRESHOLD'] * p['INVALIDATE_MULT']:\
+state = 'LOOKING'\
+else:\
+pullback_bars += 1\
+if c > sma and pullback_bars >= p['MIN_PULLBACK_BARS']:\
+entry = c\
+raw_sl = pull_extreme - atr * p['SL_BUFFER_MULT']\
+risk = max(entry - raw_sl, p['MIN_RISK_PRICE'])\
+sl = entry - risk\
+tp = entry + risk * p['RR_TARGET']\
+direction = 1\
+state = 'IN_TRADE'\
+risk_per_trade = risk\
+equity = df['Close'].iloc[:i+1].sum() # placeholder; will be updated below\
+\
+elif state == 'BEAR_IMPULSE':\
+if l < swing_low:\
+swing_low = l\
+if h >= sma and slope <= -p['SLOPE_THRESHOLD']:\
+state = 'BEAR_PULLBACK'\
+pull_extreme = h\
+pullback_bars = 0\
+elif slope > -p['SLOPE_THRESHOLD'] * p['INVALIDATE_MULT']:\
+state = 'LOOKING'\
+\
+elif state == 'BEAR_PULLBACK':\
+if h > pull_extreme:\
+pull_extreme = h\
+if h > swing_high or slope > -p['SLOPE_THRESHOLD'] * p['INVALIDATE_MULT']:\
+state = 'LOOKING'\
+else:\
+pullback_bars += 1\
+if c < sma and pullback_bars >= p['MIN_PULLBACK_BARS']:\
+entry = c\
+raw_sl = pull_extreme + atr * p['SL_BUFFER_MULT']\
+risk = max(raw_sl - entry, p['MIN_RISK_PRICE'])\
+sl = entry + risk\
+tp = entry - risk * p['RR_TARGET']\
+direction = -1\
+state = 'IN_TRADE'\
+risk_per_trade = risk\
+equity = df['Close'].iloc[:i+1].sum() # placeholder; will be updated below\
+\
+elif state == 'IN_TRADE':\
+if direction == 1:\
+if l <= sl:\
+exit_price = sl\
+exit_time = df.index[i]\
+entry_time = df.index[entry_idx] if 'entry_idx' in locals() else None\
+r = (exit_price - entry) / risk_per_trade\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': exit_time,\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': sl,\
+'Target': tp,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': exit_price if len(trades)==0 else trades[-1]['Equity'] + (exit_price - entry)\
+})\
+state = 'LOOKING'\
+elif h >= tp:\
+exit_price = tp\
+exit_time = df.index[i]\
+entry_time = df.index[entry_idx] if 'entry_idx' in locals() else None\
+r = (exit_price - entry) / risk_per_trade\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': exit_time,\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': sl,\
+'Target': tp,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': exit_price if len(trades)==0 else trades[-1]['Equity'] + (exit_price - entry)\
+})\
+state = 'LOOKING'\
+elif direction == -1:\
+if h >= sl:\
+exit_price = sl\
+exit_time = df.index[i]\
+entry_time = df.index[entry_idx] if 'entry_idx' in locals() else None\
+r = (entry - exit_price) / risk_per_trade\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': exit_time,\
+'Direction': 'SHORT',\
+'Entry': entry,\
+'Stop': sl,\
+'Target': tp,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': exit_price if len(trades)==0 else trades[-1]['Equity'] - (entry - exit_price)\
+})\
+state = 'LOOKING'\
+elif l <= tp:\
+exit_price = tp\
+exit_time = df.index[i]\
+entry_time = df.index[entry_idx] if 'entry_idx' in locals() else None\
+r = (entry - exit_price) / risk_per_trade\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': exit_time,\
+'Direction': 'SHORT',\
+'Entry': entry,\
+'Stop': sl,\
+'Target': tp,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': exit_price if len(trades)==0 else trades[-1]['Equity'] - (entry - exit_price)\
+})\
+state = 'LOOKING'\
+\
+# track entry_idx for trade time\
+if state == 'IN_TRADE' and ('entry_idx' not in locals() or entry_idx is None):\
+entry_idx = i\
+\
+if trades:\
+trades_df = pd.DataFrame(trades)\
+# Fix Entry Time if None - use previous bar\
+trades_df['Entry Time'] = trades_df['Entry Time'].fillna(df.index[0])\
+# recompute equity properly starting from initial capital\
+equity_curve = []\
+current_equity = 10000\
+for idx, row in trades_df.iterrows():\
+current_equity += row['R'] * 100 # assume risk = 100 per trade for simplicity\
+equity_curve.append(current_equity)\
+trades_df['Equity'] = equity_curve\
+return trades_df\
+else:\
+return pd.DataFrame(columns=['Entry Time', 'Exit Time', 'Direction', 'Entry', 'Stop', 'Target', 'Exit', 'R', 'Equity'])\
+\
+\
+def compute_signal_sma_slope(data, p):\
+"""Compute current signal for SMA-Slope Pullback."""\
+df = data.copy()\
+df['SMA'] = df['Close'].rolling(p['SMA_PERIOD']).mean()\
+df['SMA_Slope'] = df['SMA'].diff(p['SLOPE_LOOKBACK'])\
+\
+df['TR'] = np.maximum(df['High'] - df['Low'],\
+np.maximum(abs(df['High'] - df['Close'].shift()),\
+abs(df['Low'] - df['Close'].shift())))\
+df['ATR'] = df['TR'].rolling(p['ATR_PERIOD']).mean()\
+\
+last = df.iloc[-1]\
+prev = df.iloc[-2]\
+c = last['Close']\
+h = last['High']\
+l = last['Low']\
+sma = last['SMA']\
+slope = last['SMA_Slope']\
+atr = last['ATR']\
+pc = prev['Close']\
+psma = prev['SMA']\
+\
+if pc < psma and c > sma:\
+return 'BULL_IMPULSE'\
+elif pc > psma and c < sma:\
+return 'BEAR_IMPULSE'\
+elif c > sma and slope >= p['SLOPE_THRESHOLD']:\
+return 'BULL_PULLBACK_READY'\
+elif c < sma and slope <= -p['SLOPE_THRESHOLD']:\
+return 'BEAR_PULLBACK_READY'\
+else:\
+return 'NEUTRAL'\
+\
+\
+PARAMS_SMA_SLOPE = {\
+'Base Case': {\
+'SMA_PERIOD': 20,\
+'SLOPE_LOOKBACK': 5,\
+'SLOPE_THRESHOLD': 0.5,\
+'INVALIDATE_MULT': 0.8,\
+'MIN_PULLBACK_BARS': 3,\
+'SL_BUFFER_MULT': 1.5,\
+'MIN_RISK_PRICE': 0.5,\
+'RR_TARGET': 2.0,\
+'ATR_PERIOD': 14\
+},\
+'Loose Filter': {\
+'SMA_PERIOD': 20,\
+'SLOPE_LOOKBACK': 5,\
+'SLOPE_THRESHOLD': 0.2,\
+'INVALIDATE_MULT': 0.5,\
+'MIN_PULLBACK_BARS': 2,\
+'SL_BUFFER_MULT': 1.0,\
+'MIN_RISK_PRICE': 0.3,\
+'RR_TARGET': 2.0,\
+'ATR_PERIOD': 14\
+}\
+}\
+\
+\
+# -----------------------------------------------------------------------------\
+# Strategy B: BOS/CHoCH Fibonacci\
+# -----------------------------------------------------------------------------\
+\
+def find_swing_points(data, window=10):\
+"""Find swing highs and lows in data."""\
+swing_highs = []\
+swing_lows = []\
+\
+for i in range(window, len(data) - window):\
+# Swing High\
+if data['High'].iloc[i] == max(data['High'].iloc[i-window:i+window+1]):\
+swing_highs.append({'index': i, 'price': data['High'].iloc[i]})\
+# Swing Low\
+if data['Low'].iloc[i] == min(data['Low'].iloc[i-window:i+window+1]):\
+swing_lows.append({'index': i, 'price': data['Low'].iloc[i]})\
+\
+return swing_highs, swing_lows\
+\
+\
+def calculate_fibonacci_levels(high_price, low_price):\
+"""Calculate Fibonacci levels."""\
+diff = high_price - low_price\
+return {\
+'0%': low_price,\
+'23.6%': low_price + diff * 0.236,\
+'38.2%': low_price + diff * 0.382,\
+'50%': low_price + diff * 0.5,\
+'61.8%': low_price + diff * 0.618,\
+'78.6%': low_price + diff * 0.786,\
+'100%': high_price,\
+'161.8%': low_price + diff * 1.618\
+}\
+\
+\
+def run_backtest_fib(data, window=10):\
+"""Run BOS/CHoCH Fibonacci backtest."""\
+swing_highs, swing_lows = find_swing_points(data, window)\
+\
+trades = []\
+\
+for sh in swing_highs:\
+for sl in swing_lows:\
+if sh['price'] > sl['price'] and sh['index'] > sl['index']:\
+fib = calculate_fibonacci_levels(sh['price'], sl['price'])\
+recent_idx = max(sh['index'], sl['index'])\
+\
+if recent_idx + 1 < len(data):\
+recent_data = data.iloc[recent_idx+1:]\
+if len(recent_data) == 0:\
+continue\
+\
+# BOS: price breaks above swing high\
+if recent_data['Close'].max() > sh['price']:\
+entry = fib['61.8%']\
+stop = fib['0%']\
+target = fib['161.8%']\
+risk = abs(entry - stop)\
+if risk > 0:\
+# Simulate trade outcome\
+for j in range(recent_idx+1, len(data)):\
+bar = data.iloc[j]\
+if bar['Low'] <= stop:\
+exit_price = stop\
+r = (exit_price - entry) / risk\
+trades.append({\
+'Entry Time': data.index[recent_idx+1],\
+'Exit Time': data.index[j],\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+if bar['High'] >= target:\
+exit_price = target\
+r = (exit_price - entry) / risk\
+trades.append({\
+'Entry Time': data.index[recent_idx+1],\
+'Exit Time': data.index[j],\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+\
+# CHoCH: price breaks below swing low then recovers above 38.2%\
+elif recent_data['Close'].min() < sl['price'] and recent_data['Close'].iloc[-1] > fib['38.2%']:\
+entry = fib['78.6%']\
+stop = fib['0%']\
+target = fib['161.8%']\
+risk = abs(entry - stop)\
+if risk > 0:\
+# Simulate trade outcome\
+for j in range(recent_idx+1, len(data)):\
+bar = data.iloc[j]\
+if bar['Low'] <= stop:\
+exit_price = stop\
+r = (exit_price - entry) / risk\
+trades.append({\
+'Entry Time': data.index[recent_idx+1],\
+'Exit Time': data.index[j],\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+if bar['High'] >= target:\
+exit_price = target\
+r = (exit_price - entry) / risk\
+trades.append({\
+'Entry Time': data.index[recent_idx+1],\
+'Exit Time': data.index[j],\
+'Direction': 'LONG',\
+'Entry': entry,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+\
+if trades:\
+return pd.DataFrame(trades)\
+else:\
+return pd.DataFrame(columns=['Entry Time', 'Exit Time', 'Direction', 'Entry', 'Stop', 'Target', 'Exit', 'R', 'Equity'])\
+\
+\
+def compute_signal_fib(data, window=10):\
+"""Compute current signal for BOS/CHoCH Fibonacci."""\
+swing_highs, swing_lows = find_swing_points(data, window)\
+\
+for sh in swing_highs:\
+for sl in swing_lows:\
+if sh['price'] > sl['price'] and sh['index'] > sl['index']:\
+fib = calculate_fibonacci_levels(sh['price'], sl['price'])\
+recent_idx = max(sh['index'], sl['index'])\
+\
+if recent_idx + 1 < len(data):\
+recent_data = data.iloc[recent_idx+1:]\
+\
+# Check if recent close broke above swing high (BOS)\
+if recent_data['Close'].max() > sh['price']:\
+return {\
+'signal': 'LONG_BOS',\
+'entry': fib['61.8%'],\
+'stop': fib['0%'],\
+'target': fib['161.8%']\
+}\
+\
+# Check CHoCH pattern\
+if recent_data['Close'].min() < sl['price'] and recent_data['Close'].iloc[-1] > fib['38.2%']:\
+return {\
+'signal': 'LONG_CHOCH',\
+'entry': fib['78.6%'],\
+'stop': fib['0%'],\
+'target': fib['161.8%']\
+}\
+\
+return {'signal': 'NEUTRAL', 'entry': None, 'stop': None, 'target': None}\
+\
+\
+# -----------------------------------------------------------------------------\
+# Strategy C: School Run\
+# -----------------------------------------------------------------------------\
+\
+def run_backtest_school_run(data, rr_target=2.0, buffer=0.0002):\
+"""Run School Run backtest (daily opening breakout)."""\
+df = data.copy()\
+df['Date'] = df.index.date\
+\
+trades = []\
+\
+for day, day_data in df.groupby('Date'):\
+if len(day_data) < 3:\
+continue\
+\
+signal_bar = day_data.iloc[1] # 2nd candle\
+buy_price = signal_bar['High'] + buffer * signal_bar['Close']\
+sell_price = signal_bar['Low'] - buffer * signal_bar['Close']\
+\
+entered = False\
+direction = None\
+entry_price = None\
+stop = None\
+target = None\
+entry_time = None\
+\
+for idx, row in day_data.iloc[2:].iterrows():\
+if not entered:\
+if row['High'] >= buy_price:\
+entered = True\
+direction = 'LONG'\
+entry_price = buy_price\
+stop = signal_bar['Low']\
+risk = entry_price - stop\
+target = entry_price + risk * rr_target\
+entry_time = idx\
+elif row['Low'] <= sell_price:\
+entered = True\
+direction = 'SHORT'\
+entry_price = sell_price\
+stop = signal_bar['High']\
+risk = stop - entry_price\
+target = entry_price - risk * rr_target\
+entry_time = idx\
+else:\
+# Exit logic\
+if direction == 'LONG':\
+if row['Low'] <= stop:\
+exit_price = stop\
+r = (exit_price - entry_price) / risk\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': idx,\
+'Direction': 'LONG',\
+'Entry': entry_price,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+if row['High'] >= target:\
+exit_price = target\
+r = (exit_price - entry_price) / risk\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': idx,\
+'Direction': 'LONG',\
+'Entry': entry_price,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+elif direction == 'SHORT':\
+if row['High'] >= stop:\
+exit_price = stop\
+r = (entry_price - exit_price) / risk\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': idx,\
+'Direction': 'SHORT',\
+'Entry': entry_price,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+if row['Low'] <= target:\
+exit_price = target\
+r = (entry_price - exit_price) / risk\
+trades.append({\
+'Entry Time': entry_time,\
+'Exit Time': idx,\
+'Direction': 'SHORT',\
+'Entry': entry_price,\
+'Stop': stop,\
+'Target': target,\
+'Exit': exit_price,\
+'R': r,\
+'Equity': 10000 + len(trades) * 100 * r\
+})\
+break\
+\
+if trades:\
+return pd.DataFrame(trades)\
+else:\
+return pd.DataFrame(columns=['Entry Time', 'Exit Time', 'Direction', 'Entry', 'Stop', 'Target', 'Exit', 'R', 'Equity'])\
+\
+\
+def compute_signal_school_run(data, buffer=0.0002):\
+"""Compute current signal for School Run."""\
+df = data.copy()\
+df['Date'] = df.index.date\
+\
+today = df['Date'].iloc[-1]\
+today_data = df[df['Date'] == today]\
+\
+if len(today_data) < 3:\
+return {'signal': 'NO_TRADE', 'entry': None, 'stop': None, 'target': None}\
+\
+signal_bar = today_data.iloc[1]\
+buy_price = signal_bar['High'] + buffer * signal_bar['Close']\
+sell_price = signal_bar['Low'] - buffer * signal_bar['Close']\
+\
+last = today_data.iloc[-1]\
+\
+if last['High'] >= buy_price:\
+return {\
+'signal': 'LONG_SETUP',\
+'entry': buy_price,\
+'stop': signal_bar['Low'],\
+'target': buy_price + (buy_price - signal_bar['Low']) * 2.0\
+}\
+elif last['Low'] <= sell_price:\
+return {\
+'signal': 'SHORT_SETUP',\
+'entry': sell_price,\
+'stop': signal_bar['High'],\
+'target': sell_price - (signal_bar['High'] - sell_price) * 2.0\
+}\
+else:\
+return {'signal': 'WAITING', 'entry': None, 'stop': None, 'target': None}\
+\
+\
+# -----------------------------------------------------------------------------\
+# Data Fetching (cached)\
+# -----------------------------------------------------------------------------\
+\
+@st.cache_data(ttl=3600)\
+def cached_fetch(instrument, interval, source):\
+"""Fetch data with caching."""\
+try:\
+data = fetch_ohlcv(instrument, interval)\
+return data\
+except Exception as e:\
+if source == 'Synthetic':\
+data = generate_synthetic_data(instrument, interval)\
+return data\
+st.error(f"Error fetching data: {e}")\
+return None\
+\
+\
+# -----------------------------------------------------------------------------\
+# Main App\
+# -----------------------------------------------------------------------------\
+\
+def main():\
+st.set_page_config(page_title="Trading Dashboard", layout="wide")\
+\
+st.title("📈 Multi-Strategy Trading Dashboard")\
+st.markdown("Analyze multiple trading strategies on live or synthetic data.")\
+\
+# Sidebar config\
+st.sidebar.header("Strategy Settings")\
+\
+strategy_choice = st.sidebar.selectbox(\
+"Select Strategy",\
+['SMA-Slope Pullback', 'BOS/CHoCH Fibonacci', 'School Run']\
+)\
+\
+instrument = st.sidebar.selectbox("Instrument", SUPPORTED_INSTRUMENTS)\
+interval = st.sidebar.selectbox("Interval", INTERVAL_PERIODS)\
+\
+scenario = 'Base Case'\
+if strategy_choice == 'SMA-Slope Pullback':\
+scenario = st.sidebar.selectbox("Scenario", ['Base Case', 'Loose Filter'])\
+\
+sma_period = st.sidebar.number_input("SMA Period", min_value=5, max_value=200, value=20)\
+rr_target = st.sidebar.number_input("RR Target", min_value=1.0, max_value=10.0, value=2.0, step=0.1)\
+initial_capital = st.sidebar.number_input("Initial Capital", min_value=1000, max_value=1000000, value=10000, step=1000)\
+risk_pct = st.sidebar.number_input("Risk %", min_value=0.5, max_value=10.0, value=1.0, step=0.5)\
+data_source = st.sidebar.selectbox("Data Source", ['Live', 'Synthetic'])\
+\
+run_button = st.sidebar.button("▶ Run Analysis")\
+\
+if run_button:\
+# Fetch data\
+data = cached_fetch(instrument, interval, data_source)\
+if data is None:\
+st.error("Failed to load data. Please check your settings.")\
+return\
+\
+# Display data info\
+st.caption(f"Data Range: {data.index.min()} to {data.index.max()} | {len(data)} bars")\
+\
+# Run selected strategy\
+if strategy_choice == 'SMA-Slope Pullback':\
+params = PARAMS_SMA_SLOPE[scenario].copy()\
+params['SMA_PERIOD'] = sma_period\
+params['RR_TARGET'] = rr_target\
+trades = run_backtest_sma_slope(data, params)\
+signal = compute_signal_sma_slope(data, params)\
+elif strategy_choice == 'BOS/CHoCH Fibonacci':\
+trades = run_backtest_fib(data, window=10)\
+signal_info = compute_signal_fib(data, window=10)\
+signal = signal_info['signal']\
+elif strategy_choice == 'School Run':\
+trades = run_backtest_school_run(data, rr_target=rr_target)\
+signal_info = compute_signal_school_run(data)\
+signal = signal_info['signal']\
+else:\
+trades = None\
+signal = 'UNKNOWN'\
+\
+metrics = compute_metrics(trades)\
+formatted_metrics = format_metrics_for_display(metrics)\
+\
+# Top metric cards\
+col1, col2, col3, col4 = st.columns(4)\
+\
+with col1:\
+st.metric("Current Signal", signal)\
+with col2:\
+st.metric("Current Price", f"{data['Close'].iloc[-1]:.2f}")\
+with col3:\
+st.metric("Total Trades", formatted_metrics['total_trades'])\
+with col4:\
+st.metric("Total R", formatted_metrics['total_r'])\
+\
+# Current setup details\
+st.subheader("Current Setup")\
+if signal not in ['NEUTRAL', 'NO_TRADE', 'WAITING']:\
+if strategy_choice == 'SMA-Slope Pullback':\
+st.info(f"State: {signal}")\
+else:\
+entry = signal_info['entry'] if 'signal_info' in locals() else None\
+stop = signal_info['stop'] if 'signal_info' in locals() else None\
+target = signal_info['target'] if 'signal_info' in locals() else None\
+if entry and stop:\
+col_entry, col_stop, col_target = st.columns(3)\
+col_entry.metric("Entry", f"{entry:.2f}")\
+col_stop.metric("Stop", f"{stop:.2f}")\
+col_target.metric("Target", f"{target:.2f}")\
+\
+# Position sizing\
+size = position_sizing(initial_capital, risk_pct, entry, stop)\
+st.write(f"**Position Size:** {size:.2f} units (risk {risk_pct}% of capital)")\
+else:\
+st.info("No active setup. Waiting for signal.")\
+\
+# Tabs section\
+tab_perf, tab_trades, tab_summary = st.tabs(["Performance", "Trade Log", "Summary"])\
+\
+with tab_perf:\
+if len(trades) > 0:\
+# Equity curve\
+equity_curve = pd.DataFrame({\
+'Trade': range(1, len(trades) + 1),\
+'Equity': trades['Equity'].values\
+})\
+fig = px.line(\
+equity_curve,\
+x='Trade',\
+y='Equity',\
+title="Equity Curve",\
+markers=True\
+)\
+fig.update_layout(width='stretch', height=400)\
+st.plotly_chart(fig)\
+\
+# R distribution histogram\
+fig_hist = px.histogram(\
+trades,\
+x='R',\
+nbins=20,\
+title="R Multiple Distribution"\
+)\
+fig_hist.update_layout(width='stretch', height=350)\
+st.plotly_chart(fig_hist)\
+else:\
+st.warning("No trades generated. Try different parameters or data.")\
+\
+with tab_trades:\
+if len(trades) > 0:\
+st.dataframe(trades)\
+csv = trades.to_csv(index=False)\
+st.download_button(\
+label="Download Trade Log CSV",\
+data=csv,\
+file_name=f"trade_log_{strategy_choice.replace(' ', '_')}.csv",\
+mime="text/csv"\
+)\
+else:\
+st.info("No trades available.")\
+\
+with tab_summary:\
+if len(trades) > 0:\
+summary_df = pd.DataFrame([formatted_metrics])\
+st.dataframe(summary_df)\
+csv = summary_df.to_csv(index=False)\
+st.download_button(\
+label="Download Summary CSV",\
+data=csv,\
+file_name="summary.csv",\
+mime="text/csv"\
+)\
+else:\
+st.info("No metrics to display.")\
+\
+else:\
+st.info("Configure the strategy settings on the left and click **▶ Run Analysis** to start.")\
+\
+\
+if __name__ == "__main__":\
+main()
