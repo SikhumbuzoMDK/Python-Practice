@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from datetime import datetime, timezone
+from datetime import datetime
 
 # Import from data_fetcher module
 from data_fetcher import (
     fetch_ohlcv,
     generate_synthetic_data,
     SUPPORTED_INSTRUMENTS,
-    max_history_start,
     INTERVAL_MAX_DAYS,
 )
 
@@ -18,8 +17,9 @@ st.set_page_config(page_title="Pullback-to-SMA Strategy Dashboard", layout="wide
 
 # ==================== STRATEGY FUNCTIONS ====================
 def run_backtest(df, sma_period=50, rr=5):
+    cols = ["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R", "Equity"]
     if df is None or len(df) < sma_period + 5:
-        return pd.DataFrame(columns=["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R", "Equity"])
+        return pd.DataFrame(columns=cols)
     df = df.copy()
     df["SMA"] = df["Close"].rolling(sma_period).mean()
 
@@ -47,6 +47,10 @@ def run_backtest(df, sma_period=50, rr=5):
 
         if position == "LONG":
             initial_risk = entry - stop
+            if initial_risk == 0 or np.isnan(initial_risk):
+                position = None
+                state = "LOOKING"
+                continue
             if stop < entry and high >= entry + initial_risk:
                 stop = entry
             if low <= stop:
@@ -63,6 +67,10 @@ def run_backtest(df, sma_period=50, rr=5):
                 continue
         elif position == "SHORT":
             initial_risk = stop - entry
+            if initial_risk == 0 or np.isnan(initial_risk):
+                position = None
+                state = "LOOKING"
+                continue
             if stop > entry and low <= entry - initial_risk:
                 stop = entry
             if high >= stop:
@@ -144,14 +152,13 @@ def run_backtest(df, sma_period=50, rr=5):
                     entry_time = row["Time"]
 
     if len(trades) == 0:
-        return pd.DataFrame(columns=["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R", "Equity"])
+        return pd.DataFrame(columns=cols)
     trades = pd.DataFrame(trades, columns=["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R"])
     trades["Equity"] = trades["R"].cumsum()
     return trades
 
 
 def compute_signal(df, sma_period=50, rr=5):
-    """Determine the CURRENT signal using the latest bar (today's date)."""
     if df is None or len(df) < sma_period + 5:
         return {"state": "LOOKING", "signal": "WAIT", "current_price": None, "sma": None}
     df = df.copy()
@@ -179,6 +186,10 @@ def compute_signal(df, sma_period=50, rr=5):
 
         if position == "LONG":
             initial_risk = entry - stop
+            if initial_risk == 0 or np.isnan(initial_risk):
+                position = None
+                state = "LOOKING"
+                continue
             if stop < entry and high >= entry + initial_risk:
                 stop = entry
             if low <= stop or high >= target:
@@ -187,6 +198,10 @@ def compute_signal(df, sma_period=50, rr=5):
                 continue
         elif position == "SHORT":
             initial_risk = stop - entry
+            if initial_risk == 0 or np.isnan(initial_risk):
+                position = None
+                state = "LOOKING"
+                continue
             if stop > entry and low <= entry - initial_risk:
                 stop = entry
             if high >= stop or low <= target:
@@ -275,28 +290,55 @@ def compute_signal(df, sma_period=50, rr=5):
 
 
 def compute_metrics(trades):
+    # All-numeric values so pyarrow can serialize cleanly.
     if trades is None or len(trades) == 0:
-        return {"Trades": 0, "Wins": 0, "Losses": 0, "Win Rate": "0.00%", "Average R": 0.0, "Total R": 0.0}
-    wins = (trades["R"] > 0).sum()
-    losses = (trades["R"] < 0).sum()
-    total_r = trades["R"].sum()
-    avg_r = trades["R"].mean()
-    gross_profit = trades[trades["R"] > 0]["R"].sum()
-    gross_loss = abs(trades[trades["R"] < 0]["R"].sum())
-    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+        return {
+            "Trades": 0,
+            "Wins": 0,
+            "Losses": 0,
+            "Win Rate": 0.0,
+            "Average R": 0.0,
+            "Total R": 0.0,
+            "Profit Factor": 0.0,
+            "Max Drawdown (R)": 0.0,
+        }
+    wins = int((trades["R"] > 0).sum())
+    losses = int((trades["R"] < 0).sum())
+    total_r = float(trades["R"].sum())
+    avg_r = float(trades["R"].mean())
+    win_rate = float((trades["R"] > 0).mean())
+    gross_profit = float(trades[trades["R"] > 0]["R"].sum())
+    gross_loss = float(abs(trades[trades["R"] < 0]["R"].sum()))
+    pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
     eq = trades["Equity"]
     drawdowns = eq - eq.cummax()
-    max_dd = drawdowns.min() if len(drawdowns) > 0 else 0.0
+    max_dd = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
     return {
         "Trades": len(trades),
-        "Wins": int(wins),
-        "Losses": int(losses),
-        "Win Rate": f"{(wins / len(trades)):.2%}",
-        "Average R": round(avg_r, 2),
-        "Total R": round(total_r, 2),
-        "Profit Factor": round(pf, 2) if pf != float("inf") else "Inf",
-        "Max Drawdown (R)": round(max_dd, 2),
+        "Wins": wins,
+        "Losses": losses,
+        "Win Rate": win_rate,
+        "Average R": avg_r,
+        "Total R": total_r,
+        "Profit Factor": pf,
+        "Max Drawdown (R)": max_dd,
     }
+
+
+def format_metrics_for_display(metrics):
+    return pd.DataFrame({
+        "Metric": list(metrics.keys()),
+        "Value": [
+            metrics["Trades"],
+            metrics["Wins"],
+            metrics["Losses"],
+            f"{metrics['Win Rate']:.2%}",
+            metrics["Average R"],
+            metrics["Total R"],
+            metrics["Profit Factor"],
+            metrics["Max Drawdown (R)"],
+        ],
+    })
 
 
 def position_sizing(account, risk_pct, entry, stop):
@@ -350,7 +392,6 @@ if run_btn:
         signal = compute_signal(df, sma_period=sma_period, rr=rr)
         metrics = compute_metrics(trades)
 
-        # Show data window
         data_start = df["Time"].min()
         data_end = df["Time"].max()
         st.caption(
@@ -393,11 +434,11 @@ if run_btn:
                 initial_eq = pd.DataFrame({"Entry Time": [eq_df.iloc[0]["Entry Time"]], "Equity": [0]})
                 eq_df = pd.concat([initial_eq, eq_df], ignore_index=True)
                 fig = px.line(eq_df, x="Entry Time", y="Equity", markers=True, title="Equity Curve (R multiples)")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st.subheader("R Distribution")
                 fig2 = px.histogram(trades, x="R", nbins=40, title="Trade R-Distribution")
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
             else:
                 st.warning("No trades generated for the current parameters.")
 
@@ -412,9 +453,9 @@ if run_btn:
 
         with tab3:
             st.subheader("Summary Metrics")
-            summary_df = pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"])
-            st.dataframe(summary_df)
-            summary_csv = summary_df.to_csv(index=False)
+            display_df = format_metrics_for_display(metrics)
+            st.dataframe(display_df)
+            summary_csv = display_df.to_csv(index=False)
             st.download_button("Download Summary CSV", data=summary_csv, file_name="summary.csv", mime="text/csv")
 else:
     st.info("Adjust settings in the sidebar and click **Run Backtest** to fetch max-history data, generate trades, and see today's signal.")
