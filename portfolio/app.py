@@ -2,88 +2,24 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
-# ==================== CONFIG ====================
-SUPPORTED_INSTRUMENTS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "USDJPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "XAUUSD (Gold)": "GC=F",
-}
-
-DEFAULT_PRICES = {
-    "EURUSD": 1.08,
-    "GBPUSD": 1.28,
-    "USDJPY": 150.0,
-    "AUDUSD": 0.66,
-    "XAUUSD (Gold)": 2600.0,
-}
-
-DEFAULT_VOLATILITY = {
-    "EURUSD": 0.0004,
-    "GBPUSD": 0.0006,
-    "USDJPY": 0.0008,
-    "AUDUSD": 0.0006,
-    "XAUUSD (Gold)": 0.005,
-}
-
-DEFAULT_POINTS = {
-    "XAUUSD (Gold)": 1.0,
-}
+# Import from data_fetcher module
+from data_fetcher import (
+    fetch_ohlcv,
+    generate_synthetic_data,
+    SUPPORTED_INSTRUMENTS,
+    max_history_start,
+    INTERVAL_MAX_DAYS,
+)
 
 st.set_page_config(page_title="Pullback-to-SMA Strategy Dashboard", layout="wide")
 
 
-# ==================== DATA ====================
-def generate_synthetic_data(symbol, n=2000, seed=42):
-    np.random.seed(seed)
-    start_price = DEFAULT_PRICES.get(symbol, DEFAULT_VOLATILITY.get(symbol, 1.0))
-    # Use start price unless key missing
-    start = DEFAULT_PRICES.get(symbol, 1.0)
-    vol = DEFAULT_VOLATILITY.get(symbol, 0.001)
-    dt = timedelta(minutes=15)
-    times = [datetime(2025, 1, 1) + i * dt for i in range(n)]
-    # Geometric random walk
-    returns = np.random.normal(0, vol, n)
-    close = start * np.exp(np.cumsum(returns))
-    # Build OHLC
-    open_ = np.concatenate([[start], close[:-1]])
-    spread = np.abs(np.random.normal(0, vol, n)) * close
-    high = np.maximum(open_, close) + spread
-    low = np.minimum(open_, close) - spread
-    df = pd.DataFrame({
-        "Time": times,
-        "Open": open_,
-        "High": high,
-        "Low": low,
-        "Close": close,
-    })
-    return df
-
-
-def fetch_ohlcv(symbol, period="1y", interval="1h"):
-    try:
-        import yfinance as yf
-        ysym = SUPPORTED_INSTRUMENTS[symbol]
-        raw = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=True)
-        if raw is not None and len(raw) > 0:
-            df = raw.reset_index()
-            df = df.rename(columns={"Date": "Time", "Open": "Open", "High": "High", "Low": "Low", "Close": "Close"})
-            df = df[["Time", "Open", "High", "Low", "Close"]]
-            df["Time"] = pd.to_datetime(df["Time"])
-            return df
-        raise ValueError("No data")
-    except Exception:
-        return generate_synthetic_data(symbol)
-
-
-# ==================== STRATEGY ====================
+# ==================== STRATEGY FUNCTIONS ====================
 def run_backtest(df, sma_period=50, rr=5):
     if df is None or len(df) < sma_period + 5:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["Entry Time", "Exit Time", "Direction", "Entry", "Stop", "Target", "Exit", "R", "Equity"])
     df = df.copy()
     df["SMA"] = df["Close"].rolling(sma_period).mean()
 
@@ -215,6 +151,7 @@ def run_backtest(df, sma_period=50, rr=5):
 
 
 def compute_signal(df, sma_period=50, rr=5):
+    """Determine the CURRENT signal using the latest bar (today's date)."""
     if df is None or len(df) < sma_period + 5:
         return {"state": "LOOKING", "signal": "WAIT", "current_price": None, "sma": None}
     df = df.copy()
@@ -334,10 +271,6 @@ def compute_signal(df, sma_period=50, rr=5):
         "entry": entry,
         "stop": stop,
         "target": target,
-        "swing_high": swing_high,
-        "swing_low": swing_low,
-        "pull_high": pull_high,
-        "pull_low": pull_low,
     }
 
 
@@ -376,87 +309,112 @@ def position_sizing(account, risk_pct, entry, stop):
     return {"risk_amount": risk_amount, "units": units, "notional": notional}
 
 
+# ==================== CACHED DATA FETCH ====================
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_fetch(symbol, interval, source):
+    if source == "Live (yfinance)":
+        return fetch_ohlcv(symbol, interval=interval)
+    else:
+        freq = "h"
+        if interval == "15m":
+            freq = "15min"
+        elif interval == "30m":
+            freq = "30min"
+        elif interval == "1d":
+            freq = "D"
+        return generate_synthetic_data(symbol, freq=freq)
+
+
 # ==================== UI ====================
 st.title("Pullback-to-SMA Strategy Dashboard")
-st.markdown("Strategy: Impulse + Pullback to 50-SMA with 1:5 Risk-Reward. Initial account **R100,000**.")
+st.markdown("**Backtest:** maximum yfinance history for the selected interval. **Current signal:** today's latest bar.")
 
 with st.sidebar:
     st.header("Settings")
     instrument = st.selectbox("Instrument", list(SUPPORTED_INSTRUMENTS.keys()))
     sma_period = st.number_input("SMA Period", min_value=10, max_value=200, value=50, step=1)
-    rr = st.number_input("Risk:Reward (R)", min_value=1, max_value=20, value=5, step=1)
+    rr = st.number_input("Risk:Reward", min_value=1, max_value=20, value=5, step=1)
+    interval = st.selectbox("Interval", ["15m", "30m", "1h", "1d"], index=2)
     initial_capital = st.number_input("Initial Capital (R)", min_value=1000, value=100000, step=1000)
     risk_pct = st.number_input("Risk per Trade (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
     data_source = st.radio("Data Source", ["Live (yfinance)", "Synthetic"])
     run_btn = st.button("Run Backtest")
 
 if run_btn:
-    if data_source == "Live (yfinance)":
-        df = fetch_ohlcv(instrument)
+    df = cached_fetch(instrument, interval, data_source)
+
+    if df is None or len(df) == 0:
+        st.error("Failed to fetch data. Try another interval or use Synthetic data.")
     else:
-        df = generate_synthetic_data(instrument)
+        trades = run_backtest(df, sma_period=sma_period, rr=rr)
+        signal = compute_signal(df, sma_period=sma_period, rr=rr)
+        metrics = compute_metrics(trades)
 
-    trades = run_backtest(df, sma_period=sma_period, rr=rr)
-    signal = compute_signal(df, sma_period=sma_period, rr=rr)
-    metrics = compute_metrics(trades)
+        # Show data window
+        data_start = df["Time"].min()
+        data_end = df["Time"].max()
+        st.caption(
+            f"Backtest data: **{data_start} → {data_end}** "
+            f"({len(df)} bars, interval {interval}). "
+            f"Current signal derived from latest bar ({data_end})."
+        )
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Current Signal", signal["signal"])
-    col2.metric("Current Price", round(signal["current_price"], 4) if signal["current_price"] is not None else "N/A")
-    col3.metric("Total Trades", str(metrics["Trades"]))
-    col4.metric("Total R", str(metrics["Total R"]))
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Current Signal", signal["signal"])
+        col2.metric("Current Price", round(signal["current_price"], 4) if signal["current_price"] is not None else "N/A")
+        col3.metric("Total Trades", str(metrics["Trades"]))
+        col4.metric("Total R", str(metrics["Total R"]))
 
-    st.subheader("Current Setup")
-    if signal["signal"] != "WAIT":
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Entry", round(signal["entry"], 4) if not np.isnan(signal["entry"]) else "N/A")
-        s2.metric("Stop", round(signal["stop"], 4) if not np.isnan(signal["stop"]) else "N/A")
-        s3.metric("Target", round(signal["target"], 4) if not np.isnan(signal["target"]) else "N/A")
-    else:
-        st.info("No active trade setup. Strategy is waiting for a valid impulse-pullback signal.")
-
-    st.subheader("Position Sizing (R100,000 account)")
-    if signal["signal"] != "WAIT" and not np.isnan(signal["entry"]) and not np.isnan(signal["stop"]):
-        sizing = position_sizing(initial_capital, risk_pct, signal["entry"], signal["stop"])
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Risk Amount (R)", round(sizing["risk_amount"], 2))
-        p2.metric("Units", round(sizing["units"], 2))
-        p3.metric("Notional (R)", round(sizing["notional"], 2))
-    else:
-        st.info("Position sizing shown once a signal is active.")
-
-    tab1, tab2, tab3 = st.tabs(["Performance Dashboard", "Trade Log", "Summary"])
-
-    with tab1:
-        st.subheader("Equity Curve")
-        if len(trades) > 0:
-            eq_df = trades[["Entry Time", "Equity"]].copy()
-            initial_eq = pd.DataFrame({"Entry Time": [eq_df.iloc[0]["Entry Time"]], "Equity": [0]})
-            eq_df = pd.concat([initial_eq, eq_df], ignore_index=True)
-            eq_df["Equity"] = eq_df["Equity"] + (initial_capital * risk_pct / 100.0) * 1.0
-            fig = px.line(eq_df, x="Entry Time", y="Equity", markers=True, title="Equity Curve (R multiples)")
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.subheader("R Distribution")
-            fig2 = px.histogram(trades, x="R", nbins=40, title="Trade R-Distribution")
-            st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("Current Setup (Today)")
+        if signal["signal"] != "WAIT":
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Entry", round(signal["entry"], 4) if not np.isnan(signal["entry"]) else "N/A")
+            s2.metric("Stop", round(signal["stop"], 4) if not np.isnan(signal["stop"]) else "N/A")
+            s3.metric("Target", round(signal["target"], 4) if not np.isnan(signal["target"]) else "N/A")
         else:
-            st.warning("No trades generated for the current parameters.")
+            st.info("No active trade setup for today. Strategy is waiting for a valid impulse-pullback signal.")
 
-    with tab2:
-        st.subheader("Trade Log")
-        if len(trades) > 0:
-            st.dataframe(trades)
-            csv = trades.to_csv(index=False)
-            st.download_button("Download Trade Log CSV", data=csv, file_name="trade_log.csv", mime="text/csv")
+        st.subheader("Position Sizing (R100,000 account)")
+        if signal["signal"] != "WAIT" and not np.isnan(signal["entry"]) and not np.isnan(signal["stop"]):
+            sizing = position_sizing(initial_capital, risk_pct, signal["entry"], signal["stop"])
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Risk Amount (R)", round(sizing["risk_amount"], 2))
+            p2.metric("Units", round(sizing["units"], 2))
+            p3.metric("Notional (R)", round(sizing["notional"], 2))
         else:
-            st.warning("No trades to display.")
+            st.info("Position sizing will appear once a signal is active.")
 
-    with tab3:
-        st.subheader("Summary Metrics")
-        summary_df = pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"])
-        st.dataframe(summary_df)
-        summary_csv = summary_df.to_csv(index=False)
-        st.download_button("Download Summary CSV", data=summary_csv, file_name="summary.csv", mime="text/csv")
+        tab1, tab2, tab3 = st.tabs(["Performance Dashboard", "Trade Log", "Summary"])
+
+        with tab1:
+            st.subheader("Equity Curve")
+            if len(trades) > 0:
+                eq_df = trades[["Entry Time", "Equity"]].copy()
+                initial_eq = pd.DataFrame({"Entry Time": [eq_df.iloc[0]["Entry Time"]], "Equity": [0]})
+                eq_df = pd.concat([initial_eq, eq_df], ignore_index=True)
+                fig = px.line(eq_df, x="Entry Time", y="Equity", markers=True, title="Equity Curve (R multiples)")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.subheader("R Distribution")
+                fig2 = px.histogram(trades, x="R", nbins=40, title="Trade R-Distribution")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.warning("No trades generated for the current parameters.")
+
+        with tab2:
+            st.subheader("Trade Log")
+            if len(trades) > 0:
+                st.dataframe(trades)
+                csv = trades.to_csv(index=False)
+                st.download_button("Download Trade Log CSV", data=csv, file_name="trade_log.csv", mime="text/csv")
+            else:
+                st.warning("No trades to display.")
+
+        with tab3:
+            st.subheader("Summary Metrics")
+            summary_df = pd.DataFrame(list(metrics.items()), columns=["Metric", "Value"])
+            st.dataframe(summary_df)
+            summary_csv = summary_df.to_csv(index=False)
+            st.download_button("Download Summary CSV", data=summary_csv, file_name="summary.csv", mime="text/csv")
 else:
-    st.info("Adjust settings in the sidebar and click **Run Backtest** to generate signals and performance.")
+    st.info("Adjust settings in the sidebar and click **Run Backtest** to fetch max-history data, generate trades, and see today's signal.")
