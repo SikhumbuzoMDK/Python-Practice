@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from datetime import datetime
 
-# Import from data_fetcher module
+# Import exactly what data_fetcher exports
 from data_fetcher import (
     fetch_ohlcv,
     generate_synthetic_data,
     SUPPORTED_INSTRUMENTS,
-    INTERVAL_MAX_DAYS,
+    INTERVAL_PERIODS,
 )
 
 st.set_page_config(page_title="Pullback-to-SMA Strategy Dashboard", layout="wide")
@@ -290,7 +289,6 @@ def compute_signal(df, sma_period=50, rr=5):
 
 
 def compute_metrics(trades):
-    # All-numeric values so pyarrow can serialize cleanly.
     if trades is None or len(trades) == 0:
         return {
             "Trades": 0,
