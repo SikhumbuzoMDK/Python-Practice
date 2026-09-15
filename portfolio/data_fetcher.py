@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List
 
 # Supported instruments mapping friendly names to yfinance symbols
 SUPPORTED_INSTRUMENTS = {
@@ -16,88 +16,95 @@ SUPPORTED_INSTRUMENTS = {
 
 STANDARD_COLUMNS = ['Time', 'Open', 'High', 'Low', 'Close']
 
-# yfinance maximum history for each interval (approximate limits)
-YFINANCE_MAX_PERIOD = {
-    '1m': '7d',
-    '5m': '60d',
-    '15m': '60d',
-    '30m': '60d',
-    '1h': '730d',
-    '1d': 'max',
-    '1wk': 'max',
-    '1mo': 'max',
-}
-
-# Number of days covered by each interval's max period
-INTERVAL_MAX_DAYS = {
-    '1m': 7,
-    '5m': 60,
-    '15m': 60,
-    '30m': 60,
-    '1h': 730,
-    '1d': 3650,
-    '1wk': 3650,
-    '1mo': 3650,
+# Interval -> candidate periods to try, in order of preference (longest first).
+# FX pairs have limited intraday history on yfinance, so we try progressively
+# shorter periods until data is returned.
+INTERVAL_PERIODS = {
+    '1m': ['7d', '5d', '1d'],
+    '5m': ['60d', '30d', '1mo'],
+    '15m': ['60d', '30d', '1mo'],
+    '30m': ['60d', '30d', '1mo'],
+    '1h': ['730d', '1y', '60d', '30d'],
+    '1d': ['max', '5y', '2y', '1y'],
+    '1wk': ['max', '5y', '2y'],
+    '1mo': ['max', '5y'],
 }
 
 
-def max_history_start(interval: str, end_date: datetime = None) -> str:
-    """Return the earliest feasible start date for the given interval."""
-    if end_date is None:
-        end_date = datetime.now(timezone.utc)
-    days = INTERVAL_MAX_DAYS.get(interval, 3650)
-    start = end_date - timedelta(days=days)
-    return start.strftime('%Y-%m-%d')
+def _standardize(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a raw yfinance dataframe to the standard Time/OHLC format."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=STANDARD_COLUMNS)
+
+    # Handle MultiIndex columns (multiple tickers)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    required = ['Open', 'High', 'Low', 'Close']
+    for col in required:
+        if col not in df.columns:
+            return pd.DataFrame(columns=STANDARD_COLUMNS)
+
+    df = df.dropna(subset=required)
+
+    result = df[required].copy()
+    result.index = pd.to_datetime(result.index)
+    result.index.name = 'Time'
+    result = result.reset_index()
+    if 'index' in result.columns:
+        result = result.rename(columns={'index': 'Time'})
+    result = result[STANDARD_COLUMNS]
+    result = result.sort_values('Time').reset_index(drop=True)
+    return result
 
 
 def fetch_ohlcv(symbol: str, interval: str = '1h',
                 start: Optional[str] = None, end: Optional[str] = None,
                 period: Optional[str] = None) -> pd.DataFrame:
-    """Fetch OHLCV data from yfinance for the maximum available history.
+    """
+    Fetch OHLCV data from yfinance for the maximum available history,
+    with automatic fallback to progressively shorter periods.
 
-    - If `period` is given, uses yfinance period (e.g. '1y', 'max').
-    - Else if start/end given, uses those dates.
-    - Else fetches from max history for the interval up to today.
-    The current signal is derived from the latest bar (today).
+    - If `period` is provided, tries that period first.
+    - Else if start/end provided, uses those explicit dates.
+    - Else fetches using period-based approach (most reliable for FX intraday).
     """
     yf_symbol = SUPPORTED_INSTRUMENTS.get(symbol, symbol)
 
-    try:
-        if period:
-            df = yf.download(yf_symbol, period=period, interval=interval, progress=False)
-        else:
-            if end is None:
-                end = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-            if start is None:
-                start = max_history_start(interval, datetime.now(timezone.utc))
+    # Determine candidate periods to try
+    if period:
+        candidates = [period]
+    else:
+        candidates = INTERVAL_PERIODS.get(interval, ['60d'])
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            df = yf.download(yf_symbol, period=candidate, interval=interval, progress=False)
+            if df is not None and not df.empty:
+                result = _standardize(df)
+                if len(result) > 0:
+                    return result
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    # If period-based all failed and explicit dates were given, try date range
+    if start and end:
+        try:
             df = yf.download(yf_symbol, start=start, end=end, interval=interval, progress=False)
+            if df is not None and not df.empty:
+                result = _standardize(df)
+                if len(result) > 0:
+                    return result
+        except Exception as e:
+            last_error = str(e)
 
-        if df.empty:
-            raise ValueError(f"No data returned for symbol '{symbol}' ({yf_symbol}).")
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        required = ['Open', 'High', 'Low', 'Close']
-        for col in required:
-            if col not in df.columns:
-                raise ValueError(f"Missing column '{col}'.")
-
-        df = df.dropna(subset=required)
-
-        result = df[required].copy()
-        result.index = pd.to_datetime(result.index)
-        result.index.name = 'Time'
-        result = result.reset_index()
-        if 'index' in result.columns:
-            result = result.rename(columns={'index': 'Time'})
-        result = result[STANDARD_COLUMNS]
-        result = result.sort_values('Time').reset_index(drop=True)
-
-        return result
-
-    except Exception as e:
-        raise ValueError(f"Failed to fetch OHLCV for {symbol} ({yf_symbol}): {str(e)}")
+    raise ValueError(
+        f"Failed to fetch OHLCV for {symbol} ({yf_symbol}) at interval {interval}. "
+        f"yfinance may not have this much history for this instrument/interval. "
+        f"Last error: {last_error}"
+    )
 
 
 def generate_synthetic_data(symbol: str, n: int = 5000, seed: int = 42,
@@ -176,5 +183,4 @@ def load_uploaded_csv(file_path: str) -> pd.DataFrame:
 
     result = df[STANDARD_COLUMNS].copy()
     result = result.sort_values('Time').reset_index(drop=True)
-
     return result
