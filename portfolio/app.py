@@ -1,799 +1,705 @@
-"""\
-Pullback-to-SMA Trading Strategy Dashboard\
-\
-A complete Streamlit application for backtesting and live signal generation\
-for a pullback-to-Simple Moving Average (SMA) trading strategy.\
-"""\
-\
 import streamlit as st\
 import pandas as pd\
 import numpy as np\
+import plotly.express as px\
 import plotly.graph_objects as go\
-from plotly.subplots import make_subplots\
 from datetime import datetime, timedelta\
 import yfinance as yf\
-import io\
-import warnings\
-warnings.filterwarnings('ignore')\
 \
-# ============================================================================\
-# STRATEGY LOGIC MODULE (importable)\
-# ============================================================================\
-\
-# Mapping of instruments to yfinance symbols\
-INSTRUMENT_SYMBOLS = {\
-'EURUSD': 'EURUSD=X',\
-'GBPUSD': 'GBPUSD=X',\
-'USDJPY': 'USDJPY=X',\
-'AUDUSD': 'AUDUSD=X',\
-'XAUUSD': 'GC=F' # Gold futures as proxy\
+# ============================================================\
+# CONSTANTS\
+# ============================================================\
+SUPPORTED_INSTRUMENTS = {\
+"EURUSD": {"symbol": "EURUSD=X", "default_price": 1.08},\
+"GBPUSD": {"symbol": "GBPUSD=X", "default_price": 1.26},\
+"USDJPY": {"symbol": "USDJPY=X", "default_price": 150.5},\
+"AUDUSD": {"symbol": "AUDUSD=X", "default_price": 0.66},\
+"XAUUSD": {"symbol": "GC=F", "default_price": 2300.0},\
 }\
 \
-def generate_synthetic_data(days=500, seed=42):\
-"""Generate synthetic OHLC data for demo purposes.\
+# ============================================================\
+# DATA LOADING\
+# ============================================================\
+def fetch_ohlcv(symbol, start_date, end_date):\
+"""Fetch OHLCV data for a symbol from yfinance.\
 \
 Args:\
-days (int): Number of days of data to generate\
-seed (int): Random seed for reproducibility\
+symbol (str): The yfinance ticker symbol.\
+start_date (str or datetime.date): Start date for data.\
+end_date (str or datetime.date): End date for data.\
 \
 Returns:\
-pd.DataFrame: DataFrame with Time, Open, High, Low, Close columns\
-"""\
-np.random.seed(seed)\
-end_date = datetime.now()\
-start_date = end_date - timedelta(days=days)\
-dates = pd.date_range(start=start_date, end=end_date, freq='D')\
-\
-# Generate price with trend and volatility\
-returns = np.random.normal(0.0002, 0.01, len(dates))\
-close = 100 * np.exp(np.cumsum(returns))\
-\
-# Generate OHLC\
-open_price = np.roll(close, 1)\
-open_price[0] = close[0] * 0.999\
-high = np.maximum(open_price, close) * (1 + np.random.uniform(0, 0.005, len(dates)))\
-low = np.minimum(open_price, close) * (1 - np.random.uniform(0, 0.005, len(dates)))\
-\
-df = pd.DataFrame({\
-'Time': dates.strftime('%Y-%m-%d'),\
-'Open': open_price.round(4),\
-'High': high.round(4),\
-'Low': low.round(4),\
-'Close': close.round(4)\
-})\
-return df\
-\
-def fetch_historical_data(symbol, start_date, end_date):\
-"""Fetch historical data from yfinance.\
-\
-Args:\
-symbol (str): yfinance symbol\
-start_date (str): Start date in 'YYYY-MM-DD' format\
-end_date (str): End date in 'YYYY-MM-DD' format\
-\
-Returns:\
-pd.DataFrame: DataFrame with Time, Open, High, Low, Close columns\
+pd.DataFrame: DataFrame with columns Open, High, Low, Close, Volume.\
 """\
 try:\
-ticker = yf.Ticker(symbol)\
-data = ticker.history(start=start_date, end=end_date)\
-\
-if len(data) == 0:\
-return None\
-\
-# Rename to match expected format\
-df = data.copy()\
-df['Time'] = df.index.strftime('%Y-%m-%d')\
-df = df.rename(columns={'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close'})\
-df = df[['Time', 'Open', 'High', 'Low', 'Close']]\
-return df.reset_index(drop=True)\
-\
+data = yf.download(symbol, start=start_date, end=end_date, progress=False)\
+if data is None or data.empty:\
+raise ValueError("No data returned from yfinance")\
+# Flatten MultiIndex columns if necessary\
+if isinstance(data.columns, pd.MultiIndex):\
+data.columns = data.columns.get_level_values(0)\
+data = data.rename(columns=str.title)\
+data = data[['Open', 'High', 'Low', 'Close', 'Volume']]\
+data.index = pd.to_datetime(data.index)\
+data = data.dropna()\
+return data\
 except Exception as e:\
-st.warning(f"Error fetching data for {symbol}: {str(e)}")\
-return None\
+st.warning(f"Failed to fetch data from yfinance for {symbol}: {e}. Using synthetic data.")\
+return generate_synthetic_data(symbol, start_date, end_date)\
 \
-def calculate_sma(close, period):\
-"""Calculate Simple Moving Average.\
 \
-Args:\
-close (pd.Series): Close prices\
-period (int): SMA period\
-\
-Returns:\
-pd.Series: SMA values\
-"""\
-return close.rolling(window=period).mean()\
-\
-def run_backtest(df, sma_period=50, risk_reward=5, initial_capital=100000):\
-"""Run backtest for pullback-to-SMA strategy.\
+def generate_synthetic_data(symbol, start_date, end_date):\
+"""Generate synthetic OHLCV data when yfinance is unavailable.\
 \
 Args:\
-df (pd.DataFrame): OHLC data\
-sma_period (int): SMA period\
-risk_reward (float): Risk:Reward ratio\
-initial_capital (float): Initial account capital\
+symbol (str): The ticker symbol (used for default price).\
+start_date (str or datetime.date): Start date.\
+end_date (str or datetime.date): End date.\
 \
 Returns:\
-tuple: (trades_df, equity_curve_df, metrics_dict, signals_df)\
+pd.DataFrame: Synthetic OHLCV DataFrame.\
 """\
-df = df.copy()\
+# Determine default price from constant map, fallback to 100 if not found\
+default_price = 100.0\
+for instr_name, info in SUPPORTED_INSTRUMENTS.items():\
+if info["symbol"] == symbol:\
+default_price = info["default_price"]\
+break\
 \
-# Calculate SMA\
-df['SMA'] = calculate_sma(df['Close'], sma_period)\
+np.random.seed(42) # reproducible synthetic data\
+days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days\
+periods = max(days, 1)\
+dates = pd.date_range(start=start_date, end=end_date, freq='D')\
+if len(dates) < 2:\
+dates = pd.date_range(end=end_date, periods=250, freq='D')\
+\
+# Random walk with drift\
+returns = np.random.normal(0.0001, 0.008, len(dates))\
+close = default_price * np.exp(np.cumsum(returns))\
+\
+open_prices = close * (1 + np.random.normal(0, 0.002, len(dates)))\
+high = np.maximum(open_prices, close) * (1 + np.abs(np.random.normal(0, 0.003, len(dates))))\
+low = np.minimum(open_prices, close) * (1 - np.abs(np.random.normal(0, 0.003, len(dates))))\
+volume = np.random.randint(1000, 10000, len(dates))\
+\
+df = pd.DataFrame({\
+"Open": open_prices,\
+"High": high,\
+"Low": low,\
+"Close": close,\
+"Volume": volume.astype(float),\
+}, index=dates)\
+return df\
+\
+\
+# ============================================================\
+# STRATEGY FUNCTIONS\
+# ============================================================\
+def compute_signal(row, sma, prev_close, prev_sma):\
+"""Compute trading signal based on pullback-to-SMA state machine.\
+\
+Args:\
+row (pd.Series): Current OHLC row.\
+sma (float): Current SMA value.\
+prev_close (float): Previous close price.\
+prev_sma (float): Previous SMA value.\
+\
+Returns:\
+dict: Signal information.\
+"""\
+close = row['Close']\
+high = row['High']\
+low = row['Low']\
+sma_change = sma - prev_sma\
+\
+signal = {"direction": None, "midpoint": None, "swing_ref": None, "triggered": False}\
+\
+# BULL IMPULSE: price crosses above SMA from below\
+if prev_close < prev_sma and close > sma:\
+signal["direction"] = "bull"\
+signal["swing_ref"] = high # track swing_high\
+signal["triggered"] = True\
+\
+# BEAR IMPULSE: price crosses below SMA from above\
+elif prev_close > prev_sma and close < sma:\
+signal["direction"] = "bear"\
+signal["swing_ref"] = low # track swing_low\
+signal["triggered"] = True\
+\
+return signal\
+\
+\
+def position_sizing(equity, risk_pct, stop_distance, default_price):\
+"""Calculate position size based on risk percentage.\
+\
+Args:\
+equity (float): Current account equity.\
+risk_pct (float): Risk percentage (e.g., 0.01 for 1%).\
+stop_distance (float): Distance from entry to stop loss.\
+default_price (float): Current instrument price reference.\
+\
+Returns:\
+dict: Position sizing details (units, risk_amount, notional).\
+"""\
+risk_amount = equity * risk_pct\
+if stop_distance <= 0:\
+return {"units": 0, "risk_amount": 0, "notional": 0}\
+units = risk_amount / stop_distance\
+notional = units * default_price\
+return {\
+"units": units,\
+"risk_amount": risk_amount,\
+"notional": notional\
+}\
+\
+\
+def run_backtest(data, sma_period=50, rr_ratio=5.0, risk_pct=0.01, initial_capital=100000):\
+"""Run the pullback-to-SMA trading strategy backtest.\
+\
+Args:\
+data (pd.DataFrame): OHLCV data.\
+sma_period (int): SMA period for trend filter.\
+rr_ratio (float): Risk-reward ratio (target = RR * risk).\
+risk_pct (float): Risk per trade as fraction of equity.\
+initial_capital (float): Starting equity.\
+\
+Returns:\
+tuple: (trades_df, equity_curve, metrics, final_signal)\
+"""\
+df = data.copy()\
+df['SMA'] = df['Close'].rolling(sma_period).mean()\
+df = df.dropna()\
+\
+if len(df) < 5:\
+return pd.DataFrame(), pd.DataFrame(), {}, None\
+\
+trades = []\
+position = None # dict with entry, stop, target, direction, entry_idx, swing_ref, pull_low/pull_high\
+equity = initial_capital\
+equity_curve = []\
 \
 # State machine variables\
-trades = []\
-signals = []\
-current_state = 'WAIT'\
-swing_high = None\
-swing_low = None\
-stop_price = None\
-entry_price = None\
-target_price = None\
-position = None # 'LONG' or 'SHORT'\
+pending_signal = None\
 \
 for i in range(1, len(df)):\
 row = df.iloc[i]\
 prev_row = df.iloc[i - 1]\
+sma = row['SMA']\
+prev_sma = prev_row['SMA']\
+close = row['Close']\
+high = row['High']\
+low = row['Low']\
 \
-# Initialize signal\
-signal_dict = {\
-'Date': row['Time'],\
-'Close': row['Close'],\
-'SMA': row['SMA'] if pd.notna(row['SMA']) else None,\
-'State': current_state,\
-'Signal': 'WAIT'\
-}\
+# If in position, manage the trade\
+if position is not None:\
+# Move stop to breakeven after +1R\
+risk = abs(position['entry'] - position['stop'])\
+if position['direction'] == 'bull':\
+if close >= position['entry'] + risk:\
+position['stop'] = position['entry'] # breakeven\
+# Check stop loss\
+if low <= position['stop']:\
+exit_price = position['stop']\
+pnl = exit_price - position['entry']\
+trades.append({\
+"entry_time": df.index[position['entry_idx']],\
+"exit_time": df.index[i],\
+"direction": position['direction'],\
+"entry": position['entry'],\
+"stop": position['stop'],\
+"target": position['target'],\
+"exit": exit_price,\
+"pnl": pnl,\
+"r_multiple": pnl / risk if risk > 0 else 0,\
+"exit_reason": "stop_loss",\
+"equity_after": equity + pnl,\
+})\
+equity += pnl\
+position = None\
+# Check take profit\
+elif high >= position['target']:\
+exit_price = position['target']\
+pnl = exit_price - position['entry']\
+trades.append({\
+"entry_time": df.index[position['entry_idx']],\
+"exit_time": df.index[i],\
+"direction": position['direction'],\
+"entry": position['entry'],\
+"stop": position['stop'],\
+"target": position['target'],\
+"exit": exit_price,\
+"pnl": pnl,\
+"r_multiple": pnl / risk if risk > 0 else 0,\
+"exit_reason": "take_profit",\
+"equity_after": equity + pnl,\
+})\
+equity += pnl\
+position = None\
 \
-# Skip if SMA is NaN\
-if pd.isna(row['SMA']) or pd.isna(prev_row['SMA']):\
-signals.append(signal_dict)\
+elif position['direction'] == 'bear':\
+if close <= position['entry'] - risk:\
+position['stop'] = position['entry'] # breakeven\
+# Check stop loss\
+if high >= position['stop']:\
+exit_price = position['stop']\
+pnl = position['entry'] - exit_price\
+trades.append({\
+"entry_time": df.index[position['entry_idx']],\
+"exit_time": df.index[i],\
+"direction": position['direction'],\
+"entry": position['entry'],\
+"stop": position['stop'],\
+"target": position['target'],\
+"exit": exit_price,\
+"pnl": pnl,\
+"r_multiple": pnl / risk if risk > 0 else 0,\
+"exit_reason": "stop_loss",\
+"equity_after": equity + pnl,\
+})\
+equity += pnl\
+position = None\
+# Check take profit\
+elif low <= position['target']:\
+exit_price = position['target']\
+pnl = position['entry'] - exit_price\
+trades.append({\
+"entry_time": df.index[position['entry_idx']],\
+"exit_time": df.index[i],\
+"direction": position['direction'],\
+"entry": position['entry'],\
+"stop": position['stop'],\
+"target": position['target'],\
+"exit": exit_price,\
+"pnl": pnl,\
+"r_multiple": pnl / risk if risk > 0 else 0,\
+"exit_reason": "take_profit",\
+"equity_after": equity + pnl,\
+})\
+equity += pnl\
+position = None\
+\
+equity_curve.append({"date": df.index[i], "equity": equity})\
 continue\
 \
-sma_change = row['SMA'] - prev_row['SMA']\
+# Detect new impulse signal\
+signal = compute_signal(row, sma, prev_row['Close'], prev_sma)\
+if signal["triggered"]:\
+pending_signal = signal\
 \
-# LONG IMPULSE\
-if current_state == 'WAIT' and prev_row['Close'] < prev_row['SMA'] and row['Close'] > row['SMA']:\
-current_state = 'LONG_IMPULSE'\
-swing_high = row['High']\
-signal_dict['Signal'] = 'LONG'\
-signal_dict['State'] = 'LONG_IMPULSE'\
-\
-# SHORT IMPULSE\
-elif current_state == 'WAIT' and prev_row['Close'] > prev_row['SMA'] and row['Close'] < row['SMA']:\
-current_state = 'SHORT_IMPULSE'\
-swing_low = row['Low']\
-signal_dict['Signal'] = 'SHORT'\
-signal_dict['State'] = 'SHORT_IMPULSE'\
-\
-# LONG IMPULSE TRACKING\
-elif current_state == 'LONG_IMPULSE':\
-# Update swing high\
-if row['High'] > swing_high:\
-swing_high = row['High']\
-\
-# Check for pullback (low touches SMA)\
-if row['Low'] <= row['SMA']:\
-current_state = 'LONG_PULLBACK'\
-signal_dict['State'] = 'LONG_PULLBACK'\
-\
-# Check exit if close drops well below SMA\
-elif row['Close'] < row['SMA'] * 0.98:\
-current_state = 'WAIT'\
-signal_dict['State'] = current_state\
-\
-elif current_state == 'LONG_PULLBACK':\
-# Track pullback low\
-if 'pull_low' not in signal_dict:\
-signal_dict['pull_low'] = None\
-\
-# Entry condition: close > midpoint and positive sma_change\
-pull_low = row['Low'] if row['Low'] < row['SMA'] else row['Low']\
-midpoint = (swing_high + row['SMA']) / 2\
-\
-if row['Close'] > midpoint and sma_change > 0:\
-# ENTER LONG\
-entry_price = row['Close']\
-stop_price = pull_low\
-target_price = entry_price + risk_reward * (entry_price - stop_price)\
-position = 'LONG'\
-current_state = 'LONG_POSITION'\
-signal_dict['Signal'] = 'LONG_ENTRY'\
-signal_dict['State'] = 'LONG_POSITION'\
-signal_dict['Entry'] = entry_price\
-signal_dict['Stop'] = stop_price\
-signal_dict['Target'] = target_price\
-\
-# Check exit if close drops well below SMA\
-elif row['Close'] < row['SMA'] * 0.95:\
-current_state = 'WAIT'\
-signal_dict['State'] = current_state\
-\
-elif current_state == 'SHORT_IMPULSE':\
-# Update swing low\
-if row['Low'] < swing_low:\
-swing_low = row['Low']\
-\
-# Check for pullback (high touches SMA)\
-if row['High'] >= row['SMA']:\
-current_state = 'SHORT_PULLBACK'\
-signal_dict['State'] = 'SHORT_PULLBACK'\
-\
-# Check exit if close rises well above SMA\
-elif row['Close'] > row['SMA'] * 1.02:\
-current_state = 'WAIT'\
-signal_dict['State'] = current_state\
-\
-elif current_state == 'SHORT_PULLBACK':\
-# Track pullback high\
-if 'pull_high' not in signal_dict:\
-signal_dict['pull_high'] = None\
-\
-# Entry condition: close < midpoint and negative sma_change\
-pull_high = row['High'] if row['High'] > row['SMA'] else row['High']\
-midpoint = (swing_low + row['SMA']) / 2\
-\
-if row['Close'] < midpoint and sma_change < 0:\
-# ENTER SHORT\
-entry_price = row['Close']\
-stop_price = pull_high\
-target_price = entry_price - risk_reward * (stop_price - entry_price)\
-position = 'SHORT'\
-current_state = 'SHORT_POSITION'\
-signal_dict['Signal'] = 'SHORT_ENTRY'\
-signal_dict['State'] = 'SHORT_POSITION'\
-signal_dict['Entry'] = entry_price\
-signal_dict['Stop'] = stop_price\
-signal_dict['Target'] = target_price\
-\
-# Check exit if close rises well above SMA\
-elif row['Close'] > row['SMA'] * 1.05:\
-current_state = 'WAIT'\
-signal_dict['State'] = current_state\
-\
-# POSITION MANAGEMENT\
-elif current_state in ['LONG_POSITION', 'SHORT_POSITION']:\
-# Check for breakeven after +1R\
-if position == 'LONG':\
-risk = entry_price - stop_price\
-breakeven_price = entry_price + risk # +1R\
-\
-# Move stop to breakeven\
-if row['High'] >= breakeven_price:\
-stop_price = entry_price\
-signal_dict['Stop_Updated'] = True\
-\
-# Check exit conditions\
-if row['Low'] <= stop_price:\
-# STOP HIT\
-exit_price = stop_price\
-r_multiple = (exit_price - entry_price) / risk\
-trades.append({\
-'Date_Entry': signal_dict['Date'],\
-'Date_Exit': row['Time'],\
-'Direction': 'LONG',\
-'Entry': entry_price,\
-'Stop': stop_price,\
-'Target': target_price,\
-'Exit': exit_price,\
-'R_Multiple': r_multiple,\
-'Result': 'STOP'\
-})\
-current_state = 'WAIT'\
-position = None\
-signal_dict['Signal'] = 'STOP_HIT'\
-elif row['High'] >= target_price:\
-# TARGET HIT\
-exit_price = target_price\
-r_multiple = risk_reward\
-trades.append({\
-'Date_Entry': signal_dict['Date'],\
-'Date_Exit': row['Time'],\
-'Direction': 'LONG',\
-'Entry': entry_price,\
-'Stop': stop_price,\
-'Target': target_price,\
-'Exit': exit_price,\
-'R_Multiple': r_multiple,\
-'Result': 'TARGET'\
-})\
-current_state = 'WAIT'\
-position = None\
-signal_dict['Signal'] = 'TARGET_HIT'\
-\
-elif position == 'SHORT':\
-risk = stop_price - entry_price\
-breakeven_price = entry_price - risk # -1R\
-\
-# Move stop to breakeven\
-if row['Low'] <= breakeven_price:\
-stop_price = entry_price\
-signal_dict['Stop_Updated'] = True\
-\
-# Check exit conditions\
-if row['High'] >= stop_price:\
-# STOP HIT\
-exit_price = stop_price\
-r_multiple = (entry_price - exit_price) / risk\
-trades.append({\
-'Date_Entry': signal_dict['Date'],\
-'Date_Exit': row['Time'],\
-'Direction': 'SHORT',\
-'Entry': entry_price,\
-'Stop': stop_price,\
-'Target': target_price,\
-'Exit': exit_price,\
-'R_Multiple': r_multiple,\
-'Result': 'STOP'\
-})\
-current_state = 'WAIT'\
-position = None\
-signal_dict['Signal'] = 'STOP_HIT'\
-elif row['Low'] <= target_price:\
-# TARGET HIT\
-exit_price = target_price\
-r_multiple = risk_reward\
-trades.append({\
-'Date_Entry': signal_dict['Date'],\
-'Date_Exit': row['Time'],\
-'Direction': 'SHORT',\
-'Entry': entry_price,\
-'Stop': stop_price,\
-'Target': target_price,\
-'Exit': exit_price,\
-'R_Multiple': r_multiple,\
-'Result': 'TARGET'\
-})\
-current_state = 'WAIT'\
-position = None\
-signal_dict['Signal'] = 'TARGET_HIT'\
-\
-# Update signal state\
-signal_dict['Entry'] = entry_price if entry_price else None\
-signal_dict['Stop'] = stop_price if stop_price else None\
-signal_dict['Target'] = target_price if target_price else None\
-signal_dict['SMA_Change'] = sma_change\
-signals.append(signal_dict)\
-\
-# Convert to DataFrames\
-trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(columns=[\
-'Date_Entry', 'Date_Exit', 'Direction', 'Entry', 'Stop', 'Target', 'Exit', 'R_Multiple', 'Result'\
-])\
-\
-# Build equity curve\
-equity_curve = []\
-equity = initial_capital\
-for trade in trades:\
-equity += trade['R_Multiple'] * 1000 # Assuming $1000 risk per trade (1% of $100k)\
-equity_curve.append({\
-'Date': trade['Date_Exit'],\
-'Equity': equity,\
-'R_Multiple': trade['R_Multiple']\
-})\
-\
-# Add initial capital to equity curve\
-if equity_curve:\
-equity_curve = [{'Date': df.iloc[0]['Time'], 'Equity': initial_capital, 'R_Multiple': 0}] + equity_curve\
-equity_df = pd.DataFrame(equity_curve) if equity_curve else pd.DataFrame(columns=['Date', 'Equity', 'R_Multiple'])\
-\
-# Calculate metrics\
-metrics = {}\
-if len(trades_df) > 0:\
-# Total R\
-total_r = trades_df['R_Multiple'].sum()\
-\
-# Win rate\
-wins = trades_df[(trades_df['R_Multiple'] > 0)].shape[0]\
-win_rate = wins / len(trades_df) * 100 if len(trades_df) > 0 else 0\
-\
-# Average R\
-avg_r = trades_df['R_Multiple'].mean()\
-\
-# Max drawdown\
-equity_series = equity_df['Equity']\
-max_drawdown = 0\
-peak = equity_series.iloc[0]\
-for price in equity_series:\
-if price > peak:\
-peak = price\
-dd = (peak - price) / peak * 100\
-if dd > max_drawdown:\
-max_drawdown = dd\
-\
-# Profit factor\
-gross_profit = trades_df[trades_df['R_Multiple'] > 0]['R_Multiple'].sum()\
-gross_loss = abs(trades_df[trades_df['R_Multiple'] < 0]['R_Multiple'].sum())\
-profit_factor = gross_profit / gross_loss if gross_loss != 0 else float('inf')\
-\
-metrics = {\
-'Total_Trades': len(trades_df),\
-'Win_Rate': win_rate,\
-'Average_R': avg_r,\
-'Total_R': total_r,\
-'Max_Drawdown': max_drawdown,\
-'Profit_Factor': profit_factor\
+# If we have a pending signal and price pulls back to SMA, set pullback reference\
+if pending_signal is not None:\
+if pending_signal["direction"] == "bull":\
+# Track swing high after impulse\
+if high > pending_signal["swing_ref"]:\
+pending_signal["swing_ref"] = high\
+# Pullback: price touches or crosses below SMA\
+if low <= sma:\
+pending_signal["pull_low"] = low\
+# Entry: close > midpoint and SMA rising\
+midpoint = (pending_signal["swing_ref"] + pending_signal["pull_low"]) / 2\
+if close > midpoint and sma_change > 0:\
+entry = close\
+stop = pending_signal["pull_low"]\
+target = entry + rr_ratio * (entry - stop)\
+position = {\
+"direction": "bull",\
+"entry": entry,\
+"stop": stop,\
+"target": target,\
+"entry_idx": i,\
 }\
-else:\
-metrics = {\
-'Total_Trades': 0,\
-'Win_Rate': 0,\
-'Average_R': 0,\
-'Total_R': 0,\
-'Max_Drawdown': 0,\
-'Profit_Factor': 0\
+pending_signal = None\
+\
+elif pending_signal["direction"] == "bear":\
+# Track swing low after impulse\
+if low < pending_signal["swing_ref"]:\
+pending_signal["swing_ref"] = low\
+# Pullback: price touches or crosses above SMA\
+if high >= sma:\
+pending_signal["pull_high"] = high\
+# Entry: close < midpoint and SMA falling\
+midpoint = (pending_signal["pull_high"] + pending_signal["swing_ref"]) / 2\
+if close < midpoint and sma_change < 0:\
+entry = close\
+stop = pending_signal["pull_high"]\
+target = entry - rr_ratio * (stop - entry)\
+position = {\
+"direction": "bear",\
+"entry": entry,\
+"stop": stop,\
+"target": target,\
+"entry_idx": i,\
 }\
+pending_signal = None\
 \
-# Convert signals to DataFrame\
-signals_df = pd.DataFrame(signals)\
+equity_curve.append({"date": df.index[i], "equity": equity})\
 \
-return trades_df, equity_df, metrics, signals_df\
+trades_df = pd.DataFrame(trades)\
+equity_df = pd.DataFrame(equity_curve)\
 \
-def compute_signal(df, sma_period=50, risk_reward=5):\
-"""Compute current signal from latest data.\
+metrics = compute_metrics(trades_df, equity_df, initial_capital)\
+\
+final_signal = None\
+if position is not None:\
+final_signal = position\
+elif pending_signal is not None:\
+final_signal = pending_signal\
+\
+return trades_df, equity_df, metrics, final_signal\
+\
+\
+def compute_metrics(trades_df, equity_df, initial_capital):\
+"""Compute performance metrics from backtest results.\
 \
 Args:\
-df (pd.DataFrame): OHLC data\
-sma_period (int): SMA period\
-risk_reward (float): Risk:Reward ratio\
+trades_df (pd.DataFrame): DataFrame of trades.\
+equity_df (pd.DataFrame): Equity curve DataFrame.\
+initial_capital (float): Starting capital.\
 \
 Returns:\
-dict: Dictionary with current signal information\
+dict: Dictionary of metrics.\
 """\
-df = df.copy()\
-df['SMA'] = calculate_sma(df['Close'], sma_period)\
-\
-if len(df) < sma_period + 2:\
-return {'Signal': 'WAIT', 'Reason': 'Not enough data'}\
-\
-# Get latest values\
-last_row = df.iloc[-1]\
-prev_row = df.iloc[-2]\
-\
-sma_change = last_row['SMA'] - prev_row['SMA']\
-\
-# Check conditions\
-if prev_row['Close'] < prev_row['SMA'] and last_row['Close'] > last_row['SMA']:\
+if trades_df is None or trades_df.empty:\
 return {\
-'Signal': 'LONG',\
-'Reason': 'Bullish impulse detected',\
-'SMA_Change': sma_change\
-}\
-elif prev_row['Close'] > prev_row['SMA'] and last_row['Close'] < last_row['SMA']:\
-return {\
-'Signal': 'SHORT',\
-'Reason': 'Bearish impulse detected',\
-'SMA_Change': sma_change\
-}\
-elif pd.notna(last_row['SMA']):\
-# Check pullback conditions\
-if last_row['Low'] <= last_row['SMA'] and sma_change > 0:\
-return {\
-'Signal': 'LONG_PULLBACK',\
-'Reason': 'Pullback to SMA in uptrend',\
-'SMA_Change': sma_change\
-}\
-elif last_row['High'] >= last_row['SMA'] and sma_change < 0:\
-return {\
-'Signal': 'SHORT_PULLBACK',\
-'Reason': 'Pullback to SMA in downtrend',\
-'SMA_Change': sma_change\
+"total_trades": 0,\
+"win_rate": 0,\
+"profit_factor": 0,\
+"avg_win": 0,\
+"avg_loss": 0,\
+"max_drawdown": 0,\
+"final_equity": initial_capital,\
+"total_return_pct": 0,\
+"sharpe_ratio": 0,\
 }\
 \
+total_trades = len(trades_df)\
+wins = trades_df[trades_df['pnl'] > 0]\
+losses = trades_df[trades_df['pnl'] <= 0]\
+win_rate = len(wins) / total_trades * 100\
+\
+total_win = wins['pnl'].sum() if not wins.empty else 0\
+total_loss = abs(losses['pnl'].sum()) if not losses.empty else 0\
+profit_factor = total_win / total_loss if total_loss > 0 else float('inf')\
+\
+avg_win = wins['pnl'].mean() if not wins.empty else 0\
+avg_loss = losses['pnl'].mean() if not losses.empty else 0\
+\
+if equity_df is not None and not equity_df.empty:\
+equity = equity_df['equity'].values\
+peak = np.maximum.accumulate(equity)\
+drawdown = (peak - equity) / peak\
+max_drawdown = drawdown.max()\
+final_equity = equity[-1]\
+total_return_pct = (final_equity - initial_capital) / initial_capital * 100\
+\
+# Sharpe ratio (simplified)\
+daily_returns = np.diff(equity) / equity[:-1]\
+sharpe = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252) if np.std(daily_returns) > 0 else 0\
+else:\
+final_equity = initial_capital\
+total_return_pct = 0\
+max_drawdown = 0\
+sharpe = 0\
+\
 return {\
-'Signal': 'WAIT',\
-'Reason': 'No setup found',\
-'SMA_Change': sma_change\
+"total_trades": total_trades,\
+"win_rate": win_rate,\
+"profit_factor": profit_factor,\
+"avg_win": avg_win,\
+"avg_loss": avg_loss,\
+"max_drawdown": max_drawdown,\
+"final_equity": final_equity,\
+"total_return_pct": total_return_pct,\
+"sharpe_ratio": sharpe,\
 }\
 \
 \
-# ============================================================================\
-# STREAMLIT APPLICATION\
-# ============================================================================\
-\
-def main():\
+# ============================================================\
+# STREAMLIT APP\
+# ============================================================\
 st.set_page_config(\
-page_title="Pullback-to-SMA Strategy Dashboard",\
-page_icon="📈",\
-layout="wide"\
+page_title="Pullback-to-SMA Trading Strategy Dashboard",\
+layout="wide",\
 )\
 \
-st.title("📊 Pullback-to-SMA Trading Strategy Dashboard")\
+st.title("📈 Pullback-to-SMA Trading Strategy Dashboard")\
+st.markdown("---")\
 st.markdown("""\
-**Strategy Description:**\
-- Entry: Price breaks SMA (impulse), waits for pullback, enters on momentum resumption\
-- Exit: Risk-based targets with breakeven after +1R\
-- Risk:Reward: Configurable (default 1:5)\
+This dashboard implements a **pullback-to-SMA trading strategy** for trading 5 instruments including gold (XAUUSD).\
+The strategy identifies strong impulsive moves (BULL or BEAR), waits for a pullback to the Simple Moving Average,\
+and enters in the direction of the original impulse when price resumes the trend.\
+\
+**Instruments:** EURUSD, GBPUSD, USDJPY, AUDUSD, XAUUSD\
 """)\
 \
-# Sidebar\
+# ============================================================\
+# SIDEBAR\
+# ============================================================\
 with st.sidebar:\
 st.header("⚙️ Configuration")\
 \
-# Data source selection\
-st.subheader("Data Source")\
-data_source = st.radio(\
-"Choose data source:",\
-["Live (yfinance)", "Upload CSV", "Synthetic Data"],\
-key="data_source"\
+# Instrument selection\
+selected_instrument = st.selectbox(\
+"Select Instrument",\
+list(SUPPORTED_INSTRUMENTS.keys()),\
 )\
+instr_info = SUPPORTED_INSTRUMENTS[selected_instrument]\
+symbol = instr_info["symbol"]\
+default_price = instr_info["default_price"]\
 \
-# Instrument selection (for live data or synthetic)\
-if data_source != "Upload CSV":\
-instrument = st.selectbox(\
-"Instrument",\
-list(INSTRUMENT_SYMBOLS.keys()),\
-key="instrument"\
-)\
+# SMA period\
+sma_period = st.slider("SMA Period", min_value=10, max_value=200, value=50, step=5)\
 \
-# Upload file section\
-if data_source == "Upload CSV":\
-uploaded_file = st.file_uploader(\
-"Upload CSV file",\
-type=['csv'],\
-help="Format: Time (EET), Open, High, Low, Close"\
-)\
+# RR ratio\
+rr_ratio = st.number_input("Risk-Reward Ratio", min_value=1.0, max_value=20.0, value=5.0, step=0.5)\
 \
-# Strategy parameters\
-st.subheader("Strategy Parameters")\
-sma_period = st.slider(\
-"SMA Period",\
-min_value=10, max_value=200, value=50, step=5,\
-key="sma_period"\
-)\
+# Initial capital\
+initial_capital = st.number_input("Initial Capital (R)", min_value=10000, value=100000, step=10000)\
 \
-risk_reward = st.slider(\
-"Risk:Reward Ratio",\
-min_value=1.0, max_value=10.0, value=5.0, step=0.5,\
-key="risk_reward"\
-)\
+# Risk percentage\
+risk_pct = st.slider("Risk per Trade (%)", min_value=0.1, max_value=5.0, value=1.0, step=0.1) / 100\
 \
-# Backtest parameters\
-st.subheader("Backtest Parameters")\
-initial_capital = st.number_input(\
-"Initial Capital ($)",\
-min_value=1000, max_value=10000000, value=100000, step=1000,\
-key="initial_capital"\
-)\
+# Data source\
+data_source = st.radio("Data Source", ["yfinance", "synthetic"])\
 \
-if data_source == "Live (yfinance)":\
-default_end = datetime.now()\
-default_start = default_end - timedelta(days=365*2)\
-start_date = st.date_input("Start Date", default_start)\
-end_date = st.date_input("End Date", default_end)\
+# Date range\
+today = datetime.now()\
+default_start = today - timedelta(days=365)\
+start_date = st.date_input("Start Date", value=default_start)\
+end_date = st.date_input("End Date", value=today)\
 \
-# Run button\
-run_backtest_btn = st.button("🚀 Run Backtest", type="primary", width="100%")\
+run_button = st.button("🚀 Run Backtest", type="primary")\
 \
-# Main content\
-if run_backtest_btn:\
-# Load data based on source\
-df = None\
-\
-if data_source == "Live (yfinance)":\
-symbol = INSTRUMENT_SYMBOLS[instrument]\
-st.info(f"Fetching data for {instrument} ({symbol})...")\
-df = fetch_historical_data(symbol, str(start_date), str(end_date))\
-\
-# Fallback to synthetic if no data\
-if df is None or len(df) == 0:\
-st.warning(f"No data available for {instrument}. Using synthetic data instead.")\
-df = generate_synthetic_data()\
-\
-elif data_source == "Upload CSV":\
-if uploaded_file is not None:\
-try:\
-df = pd.read_csv(uploaded_file)\
-st.success("CSV loaded successfully")\
-\
-# Validate columns\
-required_cols = ['Time', 'Open', 'High', 'Low', 'Close']\
-if not all(col in df.columns for col in required_cols):\
-st.error(f"CSV must contain columns: {', '.join(required_cols)}")\
-st.stop()\
-\
-except Exception as e:\
-st.error(f"Error loading CSV: {str(e)}")\
-st.stop()\
+# ============================================================\
+# CACHED DATA LOADING\
+# ============================================================\
+@st.cache_data(ttl=3600)\
+def load_data_cached(symbol, start_date, end_date, data_source):\
+"""Wrapper to cache data loading."""\
+if data_source == "yfinance":\
+return fetch_ohlcv(symbol, start_date, end_date)\
 else:\
-st.warning("Please upload a CSV file or select another data source.")\
-st.stop()\
+return generate_synthetic_data(symbol, start_date, end_date)\
 \
-else: # Synthetic Data\
-st.info("Using synthetic data for demonstration...")\
-df = generate_synthetic_data(days=500)\
+# ============================================================\
+# MAIN APP LOGIC\
+# ============================================================\
+if run_button:\
+with st.spinner(f"Loading data for {selected_instrument}..."):\
+data = load_data_cached(symbol, start_date, end_date, data_source)\
+\
+if data is None or data.empty:\
+st.error("No data available for the selected parameters.")\
+else:\
+st.success(f"Loaded {len(data)} data points for {selected_instrument} ({symbol})")\
 \
 # Run backtest\
-trades_df, equity_df, metrics, signals_df = run_backtest(\
-df, sma_period, risk_reward, initial_capital\
+trades_df, equity_df, metrics, final_signal = run_backtest(\
+data,\
+sma_period=sma_period,\
+rr_ratio=rr_ratio,\
+risk_pct=risk_pct,\
+initial_capital=initial_capital,\
 )\
 \
-# Compute current signal\
-current_signal = compute_signal(df, sma_period, risk_reward)\
+# ============================================================\
+# CURRENT SIGNAL DISPLAY\
+# ============================================================\
+st.header("🎯 Current Signal")\
 \
-# Display results\
-# ============\
-\
-# Header section\
 col1, col2, col3 = st.columns(3)\
+\
+if final_signal is not None:\
 with col1:\
-st.metric(\
-"Current Signal",\
-current_signal['Signal'],\
-delta=current_signal['Reason']\
-)\
+st.metric("Signal Direction", str(final_signal.get("direction", "N/A")).upper())\
 with col2:\
-st.metric(\
-"Total Trades",\
-f"{metrics['Total_Trades']}"\
-)\
+st.metric("Signal Type", "Active Position" if "entry" in final_signal else "Pending Setup")\
 with col3:\
-st.metric(\
-"Total R",\
-f"{metrics['Total_R']:.2f}"\
+if "entry" in final_signal:\
+st.metric("Entry Price", f"{final_signal['entry']:.4f}")\
+else:\
+st.metric("Ref Price", f"{final_signal.get('swing_ref', 0):.4f}")\
+\
+st.info(\
+f"**Current Setup:** {final_signal.get('direction', '').upper()} setup detected. "\
+f"Reference level: {final_signal.get('swing_ref', 'N/A'):.4f}" if isinstance(final_signal.get('swing_ref'), (int, float)) else f"**Current Setup:** {final_signal.get('direction', '').upper()} setup detected."\
 )\
+else:\
+st.info("No active signal at the moment.")\
 \
-# Performance metrics section\
-st.subheader("📈 Performance Metrics")\
-mcol1, mcol2, mcol3, mcol4, mcol5, mcol6 = st.columns(6)\
-with mcol1:\
-st.metric("Win Rate", f"{metrics['Win_Rate']:.1f}%")\
-with mcol2:\
-st.metric("Average R", f"{metrics['Average_R']:.2f}")\
-with mcol3:\
-st.metric("Total Trades", str(metrics['Total_Trades']))\
-with mcol4:\
-st.metric("Profit Factor", f"{metrics['Profit_Factor']:.2f}" if metrics['Profit_Factor'] != float('inf') else "∞")\
-with mcol5:\
-st.metric("Max Drawdown", f"{metrics['Max_Drawdown']:.1f}%")\
-with mcol6:\
-st.metric("Initial Capital", f"${initial_capital:,.0f}")\
+# ============================================================\
+# TABS\
+# ============================================================\
+tab1, tab2, tab3, tab4 = st.tabs(["Performance Dashboard", "Trade Log", "Summary", "Position Sizing"])\
 \
-# Position sizing info\
-st.info(f"💡 Position Sizing: Risking 1% of ${initial_capital:,} = ${initial_capital * 0.01:,.2f} per trade")\
+# Tab 1: Performance Dashboard\
+with tab1:\
+st.subheader("📊 Performance Dashboard")\
 \
-# Price and signals chart\
-st.subheader("📊 Price Chart with Signals")\
-fig = make_subplots(rows=2, cols=1, shared_xaxes=True,\
-row_heights=[0.7, 0.3],\
-subplot_titles=("Price & SMA", "Equity Curve"))\
-\
-# Add candlestick chart\
-fig.add_trace(go.Candlestick(\
-x=df['Time'],\
-open=df['Open'], high=df['High'],\
-low=df['Low'], close=df['Close'],\
-name='OHLC'\
-), row=1, col=1)\
-\
-# Add SMA line\
-fig.add_trace(go.Scatter(\
-x=df['Time'],\
-y=df['SMA'],\
-name=f'SMA({sma_period})',\
-line=dict(color='orange', width=2)\
-), row=1, col=1)\
-\
-# Add trade markers\
-if len(trades_df) > 0:\
-# Long entries\
-long_trades = trades_df[trades_df['Direction'] == 'LONG']\
-fig.add_trace(go.Scatter(\
-x=long_trades['Date_Entry'],\
-y=long_trades['Entry'],\
-mode='markers',\
-marker=dict(symbol='triangle-up', size=10, color='green'),\
-name='Long Entry'\
-), row=1, col=1)\
-\
-# Short entries\
-short_trades = trades_df[trades_df['Direction'] == 'SHORT']\
-fig.add_trace(go.Scatter(\
-x=short_trades['Date_Entry'],\
-y=short_trades['Entry'],\
-mode='markers',\
-marker=dict(symbol='triangle-down', size=10, color='red'),\
-name='Short Entry'\
-), row=1, col=1)\
-\
-# Add equity curve\
-if len(equity_df) > 0:\
-fig.add_trace(go.Scatter(\
-x=equity_df['Date'],\
-y=equity_df['Equity'],\
-name='Equity Curve',\
-line=dict(color='blue', width=2)\
-), row=2, col=1)\
-\
-# Update layout\
-fig.update_layout(\
-title=f"{instrument if data_source != 'Upload CSV' else 'Uploaded Data'} - Price & Equity",\
-xaxis_rangeslider_visible=False,\
-height=600,\
-template='plotly_dark'\
+if not equity_df.empty:\
+# Equity curve\
+st.markdown("**Equity Curve**")\
+fig_equity = px.line(equity_df, x="date", y="equity", title=f"Equity Curve for {selected_instrument}")\
+fig_equity.update_layout(\
+xaxis_title="Date",\
+yaxis_title="Equity (R)",\
+height=400,\
 )\
-\
-st.plotly_chart(fig, use_container_width=True)\
-\
-# Signal table\
-st.subheader("🎯 Signal Table")\
-st.dataframe(signals_df.tail(20), use_container_width=True)\
-\
-# Trades table\
-if len(trades_df) > 0:\
-st.subheader("📋 Trade Log")\
-st.dataframe(trades_df, use_container_width=True)\
+st.plotly_chart(fig_equity, use_container_width=True)\
 \
 # R distribution histogram\
-st.subheader("📊 R-Multiple Distribution")\
-fig_r = go.Figure(data=[go.Histogram(\
-x=trades_df['R_Multiple'],\
-nbinsx=20,\
-marker_color='skyblue'\
-)])\
-fig_r.update_layout(\
-title="Distribution of R-Multiples",\
-xaxis_title="R Multiple",\
+if not trades_df.empty and 'r_multiple' in trades_df.columns:\
+st.markdown("**R-Multiple Distribution**")\
+fig_hist = px.histogram(\
+trades_df,\
+x="r_multiple",\
+nbins=20,\
+title="Distribution of Trade R-Multiples",\
+color_discrete_sequence=['#2196F3'],\
+)\
+fig_hist.update_layout(\
+xaxis_title="R-Multiple",\
 yaxis_title="Frequency",\
-template='plotly_dark'\
+height=300,\
 )\
-st.plotly_chart(fig_r, use_container_width=True)\
+st.plotly_chart(fig_hist, use_container_width=True)\
+else:\
+st.info("No trades executed yet.")\
+else:\
+st.warning("No equity data available.")\
 \
-# Monthly performance\
-st.subheader("📅 Monthly Performance")\
-trades_df['Date_Exit'] = pd.to_datetime(trades_df['Date_Exit'])\
-trades_df['Month'] = trades_df['Date_Exit'].dt.strftime('%Y-%m')\
-monthly_perf = trades_df.groupby('Month')['R_Multiple'].sum().reset_index()\
-monthly_perf.columns = ['Month', 'Total R']\
-st.dataframe(monthly_perf, use_container_width=True)\
+# Tab 2: Trade Log\
+with tab2:\
+st.subheader("📋 Trade Log")\
 \
-# Download buttons\
-st.subheader("💾 Download Data")\
-dlcol1, dlcol2, dlcol3 = st.columns(3)\
+if not trades_df.empty:\
+st.dataframe(trades_df, use_container_width=True)\
 \
-if len(trades_df) > 0:\
-with dlcol1:\
-csv_trades = trades_df.to_csv(index=False)\
+# Download button for trade log CSV\
+csv_trades = trades_df.to_csv(index=False).encode('utf-8')\
 st.download_button(\
-"📥 Download Trade Log",\
-csv_trades,\
-file_name="trade_log.csv",\
-mime="text/csv"\
+label="📥 Download Trade Log (CSV)",\
+data=csv_trades,\
+file_name=f"trade_log_{selected_instrument}.csv",\
+mime="text/csv",\
 )\
+else:\
+st.info("No trades executed yet.")\
 \
-if len(equity_df) > 0:\
-with dlcol2:\
-csv_equity = equity_df.to_csv(index=False)\
+# Tab 3: Summary\
+with tab3:\
+st.subheader("📑 Summary Metrics")\
+\
+if metrics:\
+metrics_df = pd.DataFrame({\
+"Metric": [\
+"Total Trades",\
+"Win Rate (%)",\
+"Profit Factor",\
+"Avg Win",\
+"Avg Loss",\
+"Max Drawdown",\
+"Final Equity",\
+"Total Return (%)",\
+"Sharpe Ratio",\
+],\
+"Value": [\
+metrics["total_trades"],\
+f"{metrics['win_rate']:.2f}",\
+f"{metrics['profit_factor']:.2f}",\
+f"{metrics['avg_win']:.2f}",\
+f"{metrics['avg_loss']:.2f}",\
+f"{metrics['max_drawdown']*100:.2f}%",\
+f"R {metrics['final_equity']:,.2f}",\
+f"{metrics['total_return_pct']:.2f}%",\
+f"{metrics['sharpe_ratio']:.2f}",\
+],\
+})\
+\
+st.table(metrics_df)\
+\
+# Download summary CSV\
+csv_summary = metrics_df.to_csv(index=False).encode('utf-8')\
 st.download_button(\
-"📥 Download Equity Curve",\
-csv_equity,\
-file_name="equity_curve.csv",\
-mime="text/csv"\
+label="📥 Download Summary (CSV)",\
+data=csv_summary,\
+file_name=f"summary_{selected_instrument}.csv",\
+mime="text/csv",\
+)\
+else:\
+st.warning("No metrics available.")\
+\
+# Tab 4: Position Sizing\
+with tab4:\
+st.subheader("💠 Position Sizing Calculator")\
+\
+if not trades_df.empty:\
+# Calculate position sizing based on latest trade setup stats\
+st.markdown("""\
+**Position Sizing Based on Risk Model**\
+\
+The position size is calculated as:\
+- Risk Amount = Equity × Risk %\
+- Units = Risk Amount / Stop Distance\
+- Notional = Units × Current Price\
+""")\
+\
+# Use the most recent entry if available, else use default price\
+latest_close = data['Close'].iloc[-1]\
+\
+# Show current position sizing for the last trade entry if exists\
+if not trades_df.empty:\
+last_trade = trades_df.iloc[-1]\
+entry_price = last_trade['entry']\
+stop_price = last_trade['stop']\
+stop_distance = abs(entry_price - stop_price)\
+\
+sizing = position_sizing(\
+metrics.get("final_equity", initial_capital),\
+risk_pct,\
+stop_distance,\
+latest_close,\
 )\
 \
-with dlcol3:\
-metrics_df = pd.DataFrame([metrics])\
-csv_metrics = metrics_df.to_csv(index=False)\
+cols = st.columns(4)\
+with cols[0]:\
+st.metric("Risk Amount", f"R {sizing['risk_amount']:,.2f}")\
+with cols[1]:\
+st.metric("Units to Trade", f"{sizing['units']:.2f}")\
+with cols[2]:\
+st.metric("Notional Value", f"R {sizing['notional']:,.2f}")\
+with cols[3]:\
+st.metric("Stop Distance", f"{stop_distance:.4f}")\
+\
+st.markdown("---")\
+st.markdown("**Example Position Sizing for This Trade:**")\
+st.code(f"""\
+Equity: R {metrics.get('final_equity', initial_capital):,.2f}\
+Risk %: {risk_pct*100:.2f}%\
+Risk Amount: R {sizing['risk_amount']:,.2f}\
+Entry: {entry_price:.4f}\
+Stop: {stop_price:.4f}\
+Stop Distance: {stop_distance:.4f}\
+Units: {sizing['units']:.2f}\
+Notional: R {sizing['notional']:,.2f}\
+""")\
+\
+# Download equity curve CSV\
+if not equity_df.empty:\
+csv_equity = equity_df.to_csv(index=False).encode('utf-8')\
 st.download_button(\
-"📥 Download Summary",\
-csv_metrics,\
-file_name="summary.csv",\
-mime="text/csv"\
+label="📥 Download Equity Curve (CSV)",\
+data=csv_equity,\
+file_name=f"equity_curve_{selected_instrument}.csv",\
+mime="text/csv",\
 )\
-\
-# Show information about current setup\
-st.subheader("ℹ️ Current Setup Information")\
-st.write(f"Current signal: **{current_signal['Signal']}**")\
-st.write(f"Reason: {current_signal['Reason']}")\
 \
 else:\
-# Show welcome/instructions\
-st.info("👈 Configure settings in the sidebar and click 'Run Backtest' to begin.")\
+st.info("Run backtest to see position sizing details.")\
 \
-# Show a preview of instruments\
-st.subheader("Available Instruments")\
-for inst, symbol in INSTRUMENT_SYMBOLS.items():\
-st.write(f"- **{inst}** (yfinance: {symbol})")\
+else:\
+# Show initial info\
+st.info("👈 Configure the strategy and click **Run Backtest** to start.")\
 \
-\
-if __name__ == "__main__":\
-main()
+""\
+}
