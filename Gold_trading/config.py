@@ -57,7 +57,6 @@ FRED_LAG = {
 # ----------------------------------------------------------------------------
 YAHOO_SYMBOLS = {
     "GOLD": "GC=F",
-    "GOLD_ALT": "XAUUSD=X",
     "DXY": "DX-Y.NYB",
     "TLT": "TLT",       # Long Treasury ETF (yield proxy / risk proxy)
     "GLD": "GLD",       # Gold ETF (sentiment proxy)
