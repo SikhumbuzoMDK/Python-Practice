@@ -152,6 +152,8 @@ def load_panel(offline: bool = False, force_refresh: bool = False) -> pd.DataFra
 
     - Caches raw FRED and Yahoo frames to disk.
     - In offline mode (or on failure) falls back to cached or synthetic data.
+    - Resolves the DXY name collision between Yahoo (DX-Y.NYB) and FRED
+      (DTWEXBGS) by renaming the Yahoo column to DXY_YH.
     """
     end = pd.Timestamp.today().strftime("%Y-%m-%d")
 
@@ -177,6 +179,10 @@ def load_panel(offline: bool = False, force_refresh: bool = False) -> pd.DataFra
     if yahoo is None or yahoo.empty:
         yahoo = _synthetic_yahoo()
         logger.info("Using synthetic Yahoo data (offline).")
+
+    # Resolve DXY name collision: keep FRED broad index as DXY, rename Yahoo to DXY_YH
+    if "DXY" in yahoo.columns and "DXY" in fred.columns:
+        yahoo = yahoo.rename(columns={"DXY": "DXY_YH"})
 
     # Apply publication lag to FRED series (shift forward in index time)
     fred_lagged = fred.copy()
