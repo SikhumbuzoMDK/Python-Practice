@@ -26,7 +26,10 @@ from feature_engineering import build_features, get_economic_summary
 from macro_score import compute_macro_score, classify_score, component_table
 from signals import generate_all_signals
 from regime import detect_regime, gold_performance_by_regime
-from backtest import run_all_backtests, backtest_series
+from backtest import (
+    run_all_backtests, backtest_series,
+    period_equity_curves, equity_summary, equity_drawdown_series,  # ADDED
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +122,9 @@ def render() -> None:
             st.metric("Current", sub[sig_col].iloc[-1],
                       f"Confidence {sub[conf_col].iloc[-1]:.0f}%")
 
+    # -----------------------------------------------------------------------
+    # ADDED: Period Equity Curves block
+    # -----------------------------------------------------------------------
     elif page == "Backtest Results":
         st.header("Backtest Results")
         bt = run_all_backtests(panel)
@@ -129,6 +135,28 @@ def render() -> None:
                         use_container_width=True)
         st.plotly_chart(_chart(bt_series, "weekly_score", "Weekly Signal Score"),
                         use_container_width=True)
+
+        st.subheader("Period Equity Curves")
+        curves = period_equity_curves(panel)
+        st.dataframe(equity_summary(curves).round(3))
+
+        # All timeframes + buy-and-hold
+        fig = go.Figure()
+        for col in curves.columns:
+            fig.add_trace(go.Scatter(x=curves.index, y=curves[col], mode="lines", name=col))
+        fig.update_layout(title="Strategy Equity Curves by Signal Timeframe",
+                          xaxis_title="Date", yaxis_title="Equity (x)",
+                          legend_title="Strategy")
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Selected timeframe equity + drawdown
+        tf = st.selectbox("Equity curve", ["daily", "weekly", "monthly", "yearly", "buy_hold"])
+        eq = curves[tf]
+        eq_df = pd.DataFrame({"equity": eq})
+        st.plotly_chart(_chart(eq_df, "equity", f"Equity Curve ({tf})"), use_container_width=True)
+        dd = equity_drawdown_series(eq)
+        dd_df = pd.DataFrame({"drawdown": dd})
+        st.plotly_chart(_chart(dd_df, "drawdown", f"Drawdown ({tf})"), use_container_width=True)
 
     elif page == "Economic Regime Monitor":
         st.header("Economic Regime Monitor")
