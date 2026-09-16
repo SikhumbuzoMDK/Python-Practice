@@ -8,6 +8,8 @@ signals using ONLY data available up to that date (rolling z-scores, no
 lookahead), then measures future Gold returns over 1M/3M/6M/12M. It evaluates
 win rate, average return, Sharpe, max drawdown, profit factor, precision,
 recall and accuracy.
+
+Also builds strategy equity curves per signal timeframe (period).
 """
 from __future__ import annotations
 
@@ -101,3 +103,57 @@ def backtest_series(panel: pd.DataFrame, horizon_label: str = "3M") -> pd.DataFr
     f = f.join(sig)
     f["fwd_ret"] = f["GOLD"].shift(-horizon) / f["GOLD"] - 1
     return f
+
+
+# ===========================================================================
+# ADDED: Period Equity Curves
+# ===========================================================================
+def period_equity_curves(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build strategy equity curves for each signal timeframe (period).
+
+    For each timeframe (daily/weekly/monthly/yearly), the strategy is long
+    when that timeframe's signal score >= 20 (Buy/Strong Buy) and flat
+    otherwise, with positions entered on the NEXT bar to avoid lookahead.
+    A buy-and-hold gold reference is included for comparison.
+
+    Returns a DataFrame indexed by date with columns:
+        daily, weekly, monthly, yearly, buy_hold
+    """
+    f = build_features(panel, no_lookahead=True)
+    f["macro_score"] = compute_macro_score(f, no_lookahead=True)
+    sig = generate_all_signals(f, no_lookahead=True)
+    f = f.join(sig)
+
+    curves = {}
+    for score_col in ["daily_score", "weekly_score", "monthly_score", "yearly_score"]:
+        f["signal_on"] = f[score_col] >= 20
+        f["strat_ret"] = np.where(f["signal_on"].shift(1).fillna(False), f["gold_ret"], 0.0)
+        curves[score_col.replace("_score", "")] = (1 + f["strat_ret"].fillna(0)).cumprod()
+
+    # Buy-and-hold gold reference
+    curves["buy_hold"] = (1 + f["gold_ret"].fillna(0)).cumprod()
+    return pd.DataFrame(curves)
+
+
+def equity_drawdown_series(equity: pd.Series) -> pd.Series:
+    """Return the drawdown series (equity / cumulative max - 1)."""
+    return equity / equity.cummax() - 1
+
+
+def equity_summary(curves: pd.DataFrame) -> pd.DataFrame:
+    """
+    Summarise each equity curve: final equity, max drawdown, CAGR, Sharpe.
+    """
+    rows = []
+    for col in curves.columns:
+        eq = curves[col].dropna()
+        ret = eq.pct_change().dropna()
+        rows.append({
+            "Strategy": col,
+            "Final_Equity": eq.iloc[-1],
+            "Max_Drawdown": (eq / eq.cummax() - 1).min(),
+            "CAGR": (eq.iloc[-1] ** (252 / len(eq)) - 1) if len(eq) else np.nan,
+            "Sharpe": sharpe_ratio(ret),
+        })
+    return pd.DataFrame(rows)
